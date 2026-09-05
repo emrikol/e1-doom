@@ -1,0 +1,429 @@
+#!/bin/sh
+# Foreground coordinator for the non-persistent playable proof of concept.
+# shellcheck disable=SC2329
+set -u
+
+if test "${E1_DOOM_TRACE:-0}" = 1; then
+    set -x
+fi
+
+read_stream_frame_rate()
+{
+    venc_info=$1
+    parsed_fps=$(awk '
+        index($0, "VIDEOENC 0  RC") { in_rc = 1; next }
+        in_rc && $1 == "2" { print $6; exit }
+    ' "$venc_info" 2>/dev/null || true)
+    case "$parsed_fps" in
+        ''|*[!0-9]*) parsed_fps=10 ;;
+    esac
+    if test "$parsed_fps" -lt 1 || test "$parsed_fps" -gt 30; then
+        parsed_fps=10
+    fi
+    echo "$parsed_fps"
+}
+
+# Host regression tests exercise the exact proc-table parser without touching
+# camera state.  Normal camera launches never set this switch.
+if test "${E1_DOOM_FPS_PARSE_ONLY:-0}" = 1; then
+    read_stream_frame_rate "${E1_DOOM_VENC_INFO:-/proc/hdal/venc/info}"
+    exit 0
+fi
+
+runtime=/mnt/tmp/e1-doom
+state="$runtime/state"
+root=${E1_DOOM_ROOT:-"$runtime/root"}
+game_binary=${E1_DOOM_BINARY:-"$root/bin/e1-doom"}
+controller_binary=${E1_DOOM_CONTROLLER:-"$root/bin/e1-doom-controller"}
+render_height=${E1_DOOM_RENDER_HEIGHT:-200}
+stop_requested=0
+cleanup_started=0
+watchdog_started=0
+game_pid=
+controller_pid=
+
+request_stop()
+{
+    stop_requested=1
+}
+trap request_stop INT TERM HUP
+
+heartbeat()
+{
+    : >"$state/runtime.heartbeat"
+}
+
+atomic_command()
+{
+    command_tmp="$state/injected.command.runtime.$$"
+    echo "$*" >"$command_tmp"
+    mv "$command_tmp" "$state/injected.command"
+}
+
+stop_owned_child()
+{
+    child_pid=$1
+    child_name=$2
+    test -n "$child_pid" || return 0
+    if /bin/kill -0 "$child_pid" 2>/dev/null; then
+        /bin/kill -TERM "$child_pid" 2>/dev/null || true
+        child_wait=0
+        while test "$child_wait" -lt 30 &&
+              /bin/kill -0 "$child_pid" 2>/dev/null; do
+            heartbeat
+            /bin/sleep 0.1
+            child_wait=$((child_wait + 1))
+        done
+        if /bin/kill -0 "$child_pid" 2>/dev/null; then
+            echo "$child_name pid=$child_pid ignored TERM; sending KILL" \
+                >>"$state/runtime.log"
+            /bin/kill -KILL "$child_pid" 2>/dev/null || true
+        fi
+    fi
+    wait "$child_pid" 2>/dev/null || true
+}
+
+stop_game()
+{
+    if test -n "$controller_pid" &&
+       /bin/kill -0 "$controller_pid" 2>/dev/null; then
+        /bin/kill -USR1 "$controller_pid" 2>/dev/null || true
+        /bin/sleep 0.1
+    fi
+    if test -n "$game_pid"; then
+        stop_owned_child "$game_pid" game
+        game_pid=
+    fi
+    rm -f "$state/game.pid" "$state/game.ready" "$state/ptz.sock" \
+        "$state/framebuffer.shm" "$runtime/audio.pcm"
+}
+
+stop_controller()
+{
+    if test -n "$controller_pid"; then
+        stop_owned_child "$controller_pid" controller
+        controller_pid=
+    fi
+    rm -f "$state/controller.pid" "$state/controller.ready"
+}
+
+wait_for_file()
+{
+    file=$1
+    attempts=$2
+    count=0
+    while test "$count" -lt "$attempts" && ! test -f "$file"; do
+        heartbeat
+        /bin/sleep 0.1
+        count=$((count + 1))
+    done
+    test -f "$file"
+}
+
+start_controller()
+{
+    rm -f "$state/controller.ready" "$state/controller.pid"
+    E1_DOOM_RUNTIME_STATE="$state" \
+    E1_DOOM_PTZ_SOCKET="$state/ptz.sock" E1_DOOM_HTTP_PORT=666 \
+    nohup "$controller_binary" </dev/null >"$state/controller.log" 2>&1 &
+    controller_pid=$!
+    echo "$controller_pid" >"$state/controller.pid"
+    if ! wait_for_file "$state/controller.ready" 50 ||
+       ! /bin/kill -0 "$controller_pid" 2>/dev/null; then
+        echo "controller failed to become ready" >>"$state/runtime.log"
+        stop_controller
+        return 1
+    fi
+    return 0
+}
+
+start_game()
+{
+    test -z "$game_pid" || return 1
+    rm -f "$state/game.ready" "$state/game.pid" "$state/game.start.failed" \
+        "$state/dashboard.start" "$state/dashboard.camera" \
+        "$state/ptz.sock" "$state/framebuffer.shm" "$runtime/audio.pcm"
+    echo starting >"$state/runtime.mode"
+    E1_DOOM_STATE="$state/config" \
+    E1_DOOM_RUNTIME_STATE="$state" \
+    E1_DOOM_FRAMEBUFFER="$state/framebuffer.shm" \
+    E1_DOOM_AUDIO="$runtime/audio.pcm" \
+    E1_DOOM_PTZ_SOCKET="$state/ptz.sock" \
+    E1_DOOM_HEIGHT="$render_height" E1_DOOM_FPS="$video_fps" \
+    E1_DOOM_RUN_SECONDS=0 E1_DOOM_HTTP_PORT=0 \
+    nohup "$game_binary" -iwad "$root/share/doom/doom1.wad" \
+        </dev/null >"$state/game.log" 2>&1 &
+    game_pid=$!
+    echo "$game_pid" >"$state/game.pid"
+
+    count=0
+    while test "$count" -lt 150; do
+        heartbeat
+        if test -f "$state/game.ready" &&
+           grep -q "^pid=$game_pid frame=[1-9][0-9]*$" "$state/game.ready" &&
+           grep -q '^E1_AUDIO start ' "$state/game.log" 2>/dev/null &&
+           grep -q '^E1_INPUT ready ' "$state/game.log" 2>/dev/null &&
+            test -S "$state/ptz.sock" && test -s "$state/framebuffer.shm" &&
+           test -s "$runtime/audio.pcm"; then
+            echo "game-ready pid=$game_pid $(cat "$state/game.ready")" \
+                >>"$state/runtime.log"
+            echo stock-aac-pcm-hook >"$state/audio.used"
+            atomic_command audio-stock-doom
+            if ! wait_for_file "$state/audio.active" 50; then
+                break
+            fi
+            audio_doom=1
+            rm -f "$state/runtime.start"
+            echo 1 >"$state/dashboard.start"
+            return 0
+        fi
+        if ! /bin/kill -0 "$game_pid" 2>/dev/null; then
+            break
+        fi
+        /bin/sleep 0.1
+        count=$((count + 1))
+    done
+    echo "game-start-failed pid=$game_pid" >>"$state/runtime.log"
+    echo failed >"$state/game.start.failed"
+    atomic_command audio-stop
+    count=0
+    while test "$count" -lt 50 && test -f "$state/audio.active"; do
+        heartbeat
+        /bin/sleep 0.1
+        count=$((count + 1))
+    done
+    audio_doom=0
+    stop_game
+    echo camera-armed >"$state/runtime.mode"
+    return 1
+}
+
+cleanup()
+{
+    result=0
+    test "$cleanup_started" -eq 0 || return 0
+    cleanup_started=1
+    set +e
+    heartbeat
+
+    if test -f "$state/audio.active"; then
+        atomic_command audio-stop
+        count=0
+        while test "$count" -lt 50 && test -f "$state/audio.active"; do
+            /bin/sleep 0.1
+            count=$((count + 1))
+        done
+    fi
+    if test -f "$state/injected.ready"; then
+        atomic_command ptz-camera
+        /bin/sleep 1
+        atomic_command stop
+        /bin/sleep 1
+    fi
+    stop_controller
+    stop_game
+
+    /bin/sh "$runtime/e1-ptz-device-deadman" restore-only \
+        >>"$state/runtime-cleanup-ptz.log" 2>&1 || result=1
+    /bin/sh "$runtime/e1-audio-device-deadman" restore-only \
+        >>"$state/runtime-cleanup-audio.log" 2>&1 || result=1
+    if test "$result" -eq 0; then
+        /bin/sh "$runtime/e1-injected-finalize" \
+            >>"$state/runtime-cleanup-finalize.log" 2>&1 || result=1
+    fi
+
+    device_pid=$(/bin/pidof device 2>/dev/null || true)
+    if test -z "$device_pid" ||
+       grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps" ||
+       test -f "$state/audio.patch.active" ||
+       test -f "$state/ptz.patch.active" ||
+       test -f "$state/audio.active" ||
+       test -f "$state/media.active" ||
+       ! "$runtime/e1-ptz-patch-supervisor" \
+           --inspect-device "$device_pid" >>"$state/runtime.log" 2>&1 ||
+       ! "$runtime/e1-ptz-patch-supervisor" \
+           --inspect-device-audio "$device_pid" >>"$state/runtime.log" 2>&1; then
+        result=1
+    fi
+
+    if test "$result" -eq 0; then
+        echo disarm >"$state/runtime-watchdog.disarm"
+        if test "$watchdog_started" -eq 1; then
+            # The marker is written just before the detached watchdog exits.
+            # Waiting for the child itself prevents its final log write from
+            # recreating state files after the launcher has removed tmpfs.
+            wait "$watchdog_pid" || result=1
+        fi
+    fi
+    if test "$result" -eq 0; then
+        echo complete >"$state/runtime-restored"
+        rm -f "$state/runtime.active"
+        echo "E1 Doom restored: video, microphone audio, and PTZ are stock"
+    else
+        echo failed >"$state/runtime-cleanup.failed"
+        echo "E1 Doom cleanup verification failed; detached recovery remains armed" >&2
+    fi
+    return "$result"
+}
+
+on_exit()
+{
+    status=$?
+    trap - EXIT INT TERM HUP
+    cleanup || status=1
+    exit "$status"
+}
+trap on_exit EXIT
+
+for file in e1-doom-injector e1-doom-injected.so \
+    e1-injected-supervisor e1-ptz-patch-supervisor \
+    e1-ptz-hook-owner-dummy e1-audio-device-deadman \
+    e1-ptz-device-deadman e1-injected-finalize \
+    e1-runtime-watchdog e1-osg-snapshot; do
+    test -e "$runtime/$file" || exit 1
+done
+test -x "$game_binary" || exit 1
+test -x "$controller_binary" || exit 1
+test -s "$root/share/doom/doom1.wad" || exit 1
+case "$render_height" in
+    200|300) ;;
+    *) echo "render height must be 200 or 300" >&2; exit 1 ;;
+esac
+
+device_pid=$(/bin/pidof device)
+test -n "$device_pid" || exit 1
+if grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps"; then
+    echo "refusing: injected worker already mapped" >&2
+    exit 1
+fi
+"$runtime/e1-ptz-patch-supervisor" --inspect-device "$device_pid" || exit 1
+"$runtime/e1-ptz-patch-supervisor" \
+    --inspect-device-audio "$device_pid" || exit 1
+
+mkdir -p "$state/config"
+heartbeat
+echo "runtime-start device=$device_pid" >"$state/runtime.log"
+
+# Encoder 2 is the default 640x360 H.264/Fluent stream. Read its live output
+# rate so Doom never renders more software frames than the configured camera
+# stream can carry. The proc table is authoritative for settings already
+# applied by the Reolink app.
+video_fps=$(read_stream_frame_rate /proc/hdal/venc/info)
+echo "$video_fps" >"$state/video.fps"
+
+nohup /bin/sh "$runtime/e1-injected-supervisor" idle 3 32 32 \
+    </dev/null >"$state/supervisor.stdout" 2>&1 &
+supervisor_pid=$!
+echo "$supervisor_pid" >"$state/supervisor.pid"
+wait_for_file "$state/supervisor.ready" 100 || exit 1
+
+nohup /bin/sh "$runtime/e1-runtime-watchdog" "$$" \
+    </dev/null >"$state/runtime-watchdog.stdout" 2>&1 &
+watchdog_pid=$!
+echo "$watchdog_pid" >"$state/runtime-watchdog.pid"
+wait_for_file "$state/runtime-watchdog.ready" 50 || exit 1
+watchdog_started=1
+
+echo injected >"$state/hook.active"
+echo go >"$state/go"
+wait_for_file "$state/injected.ready" 100 || exit 1
+grep -qx camera "$state/ptz.hook.mode" || exit 1
+grep -qx camera-armed "$state/runtime.mode" || exit 1
+start_controller || exit 1
+
+ptz_hook=$(/bin/busybox head -n 1 "$state/ptz.hook.address")
+audio_hook=$(/bin/busybox head -n 1 "$state/audio.hook.address")
+
+nohup "$runtime/e1-ptz-patch-supervisor" \
+    --device-doom-owner "$device_pid" "$ptz_hook" "$controller_pid" \
+    </dev/null >"$state/ptz-supervisor.log" 2>&1 &
+echo "$!" >"$state/ptz-supervisor.pid"
+if ! wait_for_file "$state/ptz-supervisor.ready" 50; then
+    echo "PTZ supervisor did not become ready:" >&2
+    cat "$state/ptz-supervisor.log" >&2
+    exit 1
+fi
+echo go >"$state/ptz-device.go"
+wait_for_file "$state/ptz-supervisor.active" 50 || exit 1
+grep -qx device-doom "$state/ptz-supervisor.active" || exit 1
+
+nohup "$runtime/e1-ptz-patch-supervisor" \
+    --device-audio-log-gate "$device_pid" "$audio_hook" \
+    </dev/null >"$state/audio-supervisor.log" 2>&1 &
+echo "$!" >"$state/audio-supervisor.pid"
+if ! wait_for_file "$state/audio-supervisor.ready" 50; then
+    echo "audio supervisor did not become ready:" >&2
+    cat "$state/audio-supervisor.log" >&2
+    exit 1
+fi
+echo go >"$state/audio-device.go"
+wait_for_file "$state/audio-supervisor.active" 50 || exit 1
+grep -qx device-audio "$state/audio-supervisor.active" || exit 1
+
+echo camera-armed >"$state/runtime.active"
+echo "E1 Doom armed and idle. Use port 666 or the PTZ code to start."
+audio_doom=0
+
+while test "$stop_requested" -eq 0; do
+    heartbeat
+    if ! /bin/kill -0 "$controller_pid" 2>/dev/null; then
+        echo "controller exited unexpectedly" >&2
+        exit 1
+    fi
+    mode=$(/bin/busybox head -n 1 "$state/runtime.mode" 2>/dev/null || true)
+    case "$mode" in
+        entry-melt|doom|exit-melt)
+            if test -z "$game_pid" ||
+               ! /bin/kill -0 "$game_pid" 2>/dev/null; then
+                echo "Doom exited unexpectedly in mode=$mode" >&2
+                exit 1
+            fi
+            if test "$audio_doom" -eq 0; then
+                echo stock-aac-pcm-hook >"$state/audio.used"
+                atomic_command audio-stock-doom
+                wait_for_file "$state/audio.active" 50 || exit 1
+                audio_doom=1
+            fi
+            ;;
+        stopping|camera-armed)
+            if test "$audio_doom" -eq 1; then
+                atomic_command audio-stop
+                count=0
+                while test "$count" -lt 50 && test -f "$state/audio.active"; do
+                    heartbeat
+                    /bin/sleep 0.1
+                    count=$((count + 1))
+                done
+                test ! -f "$state/audio.active" || exit 1
+                audio_doom=0
+            fi
+            if test -n "$game_pid"; then
+                stop_game
+            fi
+            if test "$mode" = stopping; then
+                echo camera-armed >"$state/runtime.mode"
+                mode=camera-armed
+            fi
+            if test "$mode" = camera-armed &&
+               test -f "$state/runtime.start"; then
+                rm -f "$state/runtime.start"
+                start_game || true
+            fi
+            ;;
+        starting)
+            # start_game owns the bounded readiness wait synchronously.
+            ;;
+        *)
+            echo "unexpected runtime mode: ${mode:-missing}" >&2
+            exit 1
+            ;;
+    esac
+    if test -f "$state/injected.error"; then
+        echo "injected worker error: $(cat "$state/injected.error")" >&2
+        exit 1
+    fi
+    /bin/sleep 0.1
+done
+
+test "$stop_requested" -eq 1 || exit 1
+exit 0

@@ -1,0 +1,69 @@
+#!/bin/sh
+set -eu
+
+tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH='' cd -- "$tool_dir/.." && pwd)
+# shellcheck disable=SC1091
+. "$project_dir/sources.lock"
+
+dependency_root=${E1_DOOM_DEPENDENCY_ROOT:-"$project_dir/.deps"}
+mkdir -p "$dependency_root"
+
+fetch_and_patch()
+{
+    name=$1
+    url=$2
+    commit=$3
+    patch=$4
+    destination="$dependency_root/$name"
+
+    if test ! -d "$destination/.git" &&
+       test -f "$destination/.e1-doom-corresponding-source" &&
+       test "$(cat "$destination/.e1-doom-corresponding-source")" = "$commit"; then
+        echo "$name $commit (materialized corresponding source)"
+        return 0
+    fi
+
+    if test ! -d "$destination/.git"; then
+        test ! -e "$destination" || {
+            echo "$destination exists but is not a Git checkout" >&2
+            exit 1
+        }
+        git clone --filter=blob:none "$url" "$destination"
+    fi
+
+    actual_url=$(git -C "$destination" remote get-url origin)
+    test "$actual_url" = "$url" || {
+        echo "$destination has unexpected origin: $actual_url" >&2
+        exit 1
+    }
+
+    git -C "$destination" cat-file -e "$commit^{commit}" 2>/dev/null ||
+        git -C "$destination" fetch --depth=1 origin "$commit"
+
+    if test "$(git -C "$destination" rev-parse HEAD)" != "$commit"; then
+        if ! git -C "$destination" diff --quiet ||
+           ! git -C "$destination" diff --cached --quiet; then
+                echo "$destination has local changes; refusing to replace them" >&2
+                exit 1
+        fi
+        git -C "$destination" checkout --detach "$commit"
+    fi
+
+    if git -C "$destination" apply --reverse --check "$patch" 2>/dev/null; then
+        : # Already patched.
+    elif git -C "$destination" apply --check "$patch"; then
+        git -C "$destination" apply "$patch"
+    else
+        echo "$patch does not apply cleanly to $name at $commit" >&2
+        exit 1
+    fi
+
+    test "$(git -C "$destination" rev-parse HEAD)" = "$commit"
+    echo "$name $commit"
+}
+
+fetch_and_patch woof "$WOOF_URL" "$WOOF_COMMIT" \
+    "$project_dir/patches/woof/e1-doom.patch"
+fetch_and_patch rp2040-doom "$RP2040_DOOM_URL" "$RP2040_DOOM_COMMIT" \
+    "$project_dir/patches/rp2040-doom-opl/e1-doom.patch"

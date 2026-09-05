@@ -1,0 +1,249 @@
+#!/bin/sh
+# Own the injected worker's heartbeat and unload lifecycle. This script starts
+# behind a barrier so an independent dead-man is live before ptrace writes.
+set -eu
+
+mode=${1:-idle}
+encoder=${2:-3}
+width=${3:-32}
+height=${4:-32}
+runtime=/mnt/tmp/e1-doom
+state="$runtime/state"
+injector="$runtime/e1-doom-injector"
+library="$runtime/e1-doom-injected.so"
+patch_supervisor="$runtime/e1-ptz-patch-supervisor"
+stop_requested=0
+
+case "$mode" in
+    idle|alloc|transparent|checkerboard|doom|audio-tone|audio-stock-tone|audio-stock-doom) ;;
+    *) exit 2 ;;
+esac
+
+# The function is invoked by the traps below.
+# shellcheck disable=SC2329
+request_stop()
+{
+    stop_requested=1
+}
+trap request_stop USR1 TERM INT HUP
+
+atomic_command()
+{
+    command_tmp="$state/injected.command.$$"
+    echo "$*" >"$command_tmp"
+    mv "$command_tmp" "$state/injected.command"
+}
+
+cleanup()
+{
+    set +e
+    rm -f "$state/heartbeat"
+    if test -f "$state/audio.patch.used"; then
+        if test -f "$state/audio.active"; then
+            atomic_command audio-stop
+            count=0
+            while test "$count" -lt 8 &&
+                  ! test -f "$state/audio.source.restored"; do
+                sleep 1
+                count=$((count + 1))
+            done
+        fi
+        if test -s "$state/audio-owner.pid"; then
+            owner=$(head -n 1 "$state/audio-owner.pid")
+            if test -r "/proc/$owner/cmdline"; then
+                case $(tr '\000' ' ' <"/proc/$owner/cmdline") in
+                    *e1-ptz-hook-owner-dummy*) kill -KILL "$owner" 2>/dev/null || true ;;
+                esac
+            fi
+        fi
+        if test -s "$state/audio-supervisor.pid"; then
+            patch_supervisor=$(head -n 1 "$state/audio-supervisor.pid")
+            if test -r "/proc/$patch_supervisor/cmdline"; then
+                case $(tr '\000' ' ' <"/proc/$patch_supervisor/cmdline") in
+                    *e1-ptz-patch-supervisor*)
+                        kill -USR1 "$patch_supervisor" 2>/dev/null || true
+                        ;;
+                esac
+            fi
+        fi
+        count=0
+        while test "$count" -lt 12 &&
+              { ! test -f "$state/audio.restored" ||
+                ! test -f "$state/audio.hook.quiesced" ||
+                test -f "$state/audio.active" ||
+                test -f "$state/audio.patch.active"; }; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if ! test -f "$state/audio.restored" ||
+           ! test -f "$state/audio.hook.quiesced" ||
+           test -f "$state/audio.patch.active"; then
+            echo audio-not-restored-refuse-unload >>"$state/supervisor.log"
+            echo supervisor-cleanup-failed >"$state/recovery.failed"
+            exit 1
+        fi
+    fi
+    if test -f "$state/ptz.patch.used"; then
+        count=0
+        while test "$count" -lt 8 &&
+              { ! test -f "$state/ptz.restored" ||
+                ! test -f "$state/ptz.hook.quiesced" ||
+                test -f "$state/ptz.patch.active"; }; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if ! test -f "$state/ptz.restored" ||
+           ! test -f "$state/ptz.hook.quiesced" ||
+           test -f "$state/ptz.patch.active"; then
+            echo ptz-not-restored-refuse-unload >>"$state/supervisor.log"
+            echo supervisor-cleanup-failed >"$state/recovery.failed"
+            exit 1
+        fi
+    fi
+    if test -s "$state/injected.handle"; then
+        atomic_command quit
+        count=0
+        while test "$count" -lt 8 && ! test -f "$state/thread.exited"; do
+            sleep 1
+            count=$((count + 1))
+        done
+        handle=$(cat "$state/injected.handle")
+        device_pid=$(pidof device 2>/dev/null || true)
+        count=0
+        while test "$count" -lt 8 && test -f "$state/audio.used" &&
+              { ! test -f "$state/audio.restored" ||
+                test -f "$state/audio.active"; }; do
+            sleep 1
+            count=$((count + 1))
+        done
+        audio_cleanup_ok=1
+        if test -f "$state/audio.used" &&
+           { ! test -f "$state/audio.restored" ||
+             test -f "$state/audio.active"; }; then
+            audio_cleanup_ok=0
+        fi
+        printf 'unload-preconditions device=%s thread=%s media_restored=%s ' \
+               "$device_pid" "$(test -f "$state/thread.exited" && echo yes || echo no)" \
+               "$(test -f "$state/media.restored" && echo yes || echo no)" \
+               >>"$state/supervisor.log"
+        printf 'media_active=%s audio_ok=%s mapped=%s\n' \
+               "$(test -f "$state/media.active" && echo yes || echo no)" \
+               "$audio_cleanup_ok" \
+               "$(test -n "$device_pid" && grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps" && echo yes || echo no)" \
+               >>"$state/supervisor.log"
+        if test -f "$state/audio.patch.used" &&
+           { ! test -f "$state/audio.hook.quiesced" ||
+             test -f "$state/audio.patch.active"; }; then
+            audio_cleanup_ok=0
+        fi
+        if test -n "$device_pid" && test -f "$state/thread.exited" &&
+           test -f "$state/media.restored" &&
+           ! test -f "$state/media.active" &&
+           test "$audio_cleanup_ok" -eq 1 &&
+           "$injector" --unload "$device_pid" "$handle" >>"$state/supervisor.log" 2>&1 &&
+           ! grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps"; then
+            rm -f "$state/injected.handle" "$state/hook.active"
+            rm -f "$state/ptz.patch.used" "$state/ptz.patch.restored" \
+                "$state/ptz.hook.quiesced"
+            # Retain the byte-restoration and quiescence proofs until the
+            # outer gate has verified them. The gate removes the whole
+            # volatile state directory after recording its evidence.
+            rm -f "$state/audio.patch.used"
+            echo injected-cleanup-complete >"$state/restored"
+            echo complete >"$state/supervisor.exited"
+            exit 0
+        fi
+    elif ! test -f "$state/injector.patch.active"; then
+        device_pid=$(pidof device 2>/dev/null || true)
+        if test -n "$device_pid" &&
+           ! grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps"; then
+            rm -f "$state/hook.active"
+            echo no-library-loaded >"$state/restored"
+            echo complete >"$state/supervisor.exited"
+            exit 0
+        fi
+    fi
+    echo supervisor-cleanup-failed >"$state/recovery.failed"
+    exit 1
+}
+
+test -x "$injector"
+test -r "$library"
+test -x "$patch_supervisor"
+device_pid=$(pidof device)
+test -n "$device_pid"
+"$patch_supervisor" --inspect-device "$device_pid"
+"$patch_supervisor" --inspect-device-audio "$device_pid"
+echo ready >"$state/supervisor.ready"
+while ! test -f "$state/go" && test "$stop_requested" -eq 0; do
+    sleep 1
+done
+rm -f "$state/supervisor.ready"
+test "$stop_requested" -eq 0 || cleanup
+
+device_pid=$(pidof device)
+if ! "$injector" --probe "$device_pid" >>"$state/supervisor.log" 2>&1; then
+    echo injector-probe-failed >>"$state/supervisor.log"
+    cleanup
+fi
+if ! "$injector" --load "$device_pid" "$library" \
+    >"$state/injector-load.log" 2>&1; then
+    echo injector-load-failed >>"$state/supervisor.log"
+    cleanup
+fi
+handle=$(sed -n 's/.*handle=\(0x[0-9a-fA-F]*\).*/\1/p' "$state/injector-load.log")
+case "$handle" in
+    0x[0-9a-fA-F]*) ;;
+    *) cleanup ;;
+esac
+echo "$handle" >"$state/injected.handle"
+
+count=0
+while test "$count" -lt 8 && ! test -f "$state/injected.ready" &&
+      ! test -f "$state/injected.error"; do
+    sleep 1
+    count=$((count + 1))
+done
+test -f "$state/injected.ready" || cleanup
+
+touch "$state/heartbeat"
+case "$mode" in
+    alloc) atomic_command "alloc $width $height" ;;
+    transparent) atomic_command "transparent $encoder $width $height" ;;
+    checkerboard) atomic_command "checkerboard $encoder $width $height" ;;
+    doom) atomic_command "doom $encoder" ;;
+    audio-tone)
+        echo native-aac-tone >"$state/audio.used"
+        atomic_command "audio-tone"
+        ;;
+    audio-stock-tone)
+        echo stock-aac-pcm-hook >"$state/audio.used"
+        atomic_command "audio-stock-tone"
+        ;;
+    audio-stock-doom)
+        echo stock-aac-pcm-hook >"$state/audio.used"
+        atomic_command "audio-stock-doom"
+        ;;
+esac
+
+if test "$mode" != idle; then
+    active_marker=media.active
+    case "$mode" in
+        audio-tone|audio-stock-tone|audio-stock-doom) active_marker=audio.active ;;
+    esac
+    count=0
+    while test "$count" -lt 8 && ! test -f "$state/$active_marker" &&
+          ! test -f "$state/injected.error"; do
+        touch "$state/heartbeat"
+        sleep 1
+        count=$((count + 1))
+    done
+    test -f "$state/$active_marker" || cleanup
+fi
+echo "$mode" >"$state/supervisor.active"
+
+while test "$stop_requested" -eq 0 && ! test -f "$state/stop.request"; do
+    touch "$state/heartbeat"
+    sleep 1
+done
+cleanup

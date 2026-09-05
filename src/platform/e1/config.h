@@ -1,0 +1,15 @@
+#ifndef E1_WOOF_CONFIG_H
+#define E1_WOOF_CONFIG_H
+
+#define PROJECT_NAME "Woof"
+#define PROJECT_VERSION "15.3.0-e1"
+#define PROJECT_STRING "Woof 15.3.0-e1"
+#define PROJECT_SHORTNAME "woof"
+
+#define HAVE_LIBM 1
+#define HAVE_DIRENT_H 1
+#define HAVE_DECL_STRCASECMP 1
+#define HAVE_DECL_STRNCASECMP 1
+#define HAVE_GETPWUID 1
+
+#endif

@@ -1,0 +1,162 @@
+#!/bin/sh
+# SD-card launcher used manually or by the persistent-root boot service. It
+# reads the flat SD tree and removes tmpfs state only after camera restoration.
+# shellcheck disable=SC2329
+set -u
+
+compatibility_reservation=${E1_COMPATIBILITY_RESERVATION:-/mnt/sda/.e1-compatibility-reserved}
+if test "${E1_DOOM_PROBE_ONLY:-0}" != 1 &&
+   test -e "$compatibility_reservation"; then
+    echo "refusing: E1 Zoom is reserved for stock/compatibility work" >&2
+    echo "the reservation must be released explicitly before an intentional live run" >&2
+    exit 2
+fi
+
+flat_root=${E1_DOOM_ROOT:-/mnt/sda/e1-doom-flat}
+binary_override=${E1_DOOM_BINARY_OVERRIDE:-}
+runtime_override=${E1_DOOM_RUNTIME_OVERRIDE:-}
+runtime=/mnt/tmp/e1-doom
+root=$flat_root
+state="$runtime/state"
+lock=/mnt/tmp/e1-doom.lock
+child=
+status=1
+child_started=0
+safe=0
+
+remove_runtime_files()
+{
+    rm -f "$runtime/audio.pcm"
+    rm -rf "$state/config"
+    rm -f "$state"/*
+    rmdir "$state" 2>/dev/null || true
+    for file in e1-doom-injector e1-doom-injected.so \
+        e1-injected-supervisor e1-ptz-patch-supervisor \
+        e1-ptz-hook-owner-dummy e1-audio-device-deadman \
+        e1-ptz-device-deadman e1-injected-finalize \
+        e1-runtime-watchdog e1-osg-snapshot e1-doom-override \
+        e1-doom-runtime-override; do
+        rm -f "$runtime/$file"
+    done
+}
+
+launcher_exit()
+{
+    exit_status=$?
+    trap - EXIT INT TERM HUP
+    if test "$child_started" -eq 0; then
+        remove_runtime_files
+        rmdir "$runtime" 2>/dev/null || true
+    elif test "$safe" -ne 1; then
+        echo "leaving recovered runtime for inspection" >&2
+    else
+        remove_runtime_files
+        rmdir "$runtime" 2>/dev/null || true
+    fi
+    test -e "$runtime" || rm -f "$lock"
+    exit "$exit_status"
+}
+trap launcher_exit EXIT
+
+exec 9>"$lock" || exit 1
+if ! /usr/bin/flock -n 9; then
+    echo "E1 Doom is already running" >&2
+    exit 1
+fi
+if test -e "$runtime"; then
+    echo "refusing: $runtime already exists; inspect recovery evidence first" >&2
+    exit 1
+fi
+test -d "$root/bin" && test -d "$root/share/doom" || exit 1
+mkdir -p "$state"
+echo "$$" >"$state/launcher.pid"
+
+if test "${E1_DOOM_PROBE_ONLY:-0}" = 1; then
+    "$root/bin/e1-doom-probe"
+    device_pid=$(/bin/pidof device 2>/dev/null || true)
+    test -n "$device_pid" || exit 1
+    ! grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps" || exit 1
+    "$root/bin/e1-ptz-patch-supervisor" --inspect-device "$device_pid" || exit 1
+    "$root/bin/e1-ptz-patch-supervisor" \
+        --inspect-device-audio "$device_pid" || exit 1
+    safe=1
+    remove_runtime_files
+    rmdir "$runtime"
+    rm -f "$lock"
+    trap - EXIT
+    echo "E1 Doom package probe complete; runtime removed"
+    exit 0
+fi
+
+cp "$root/bin/e1-doom-injected.so" "$runtime/e1-doom-injected.so" || exit 1
+chmod 555 "$runtime/e1-doom-injected.so" || exit 1
+game_binary="$root/bin/e1-doom"
+runtime_script="$root/bin/e1-doom-runtime"
+if test -n "$binary_override"; then
+    test -s "$binary_override" || exit 1
+    cp "$binary_override" "$runtime/e1-doom-override" || exit 1
+    chmod 555 "$runtime/e1-doom-override" || exit 1
+    game_binary="$runtime/e1-doom-override"
+fi
+if test -n "$runtime_override"; then
+    test -s "$runtime_override" || exit 1
+    cp "$runtime_override" "$runtime/e1-doom-runtime-override" || exit 1
+    chmod 555 "$runtime/e1-doom-runtime-override" || exit 1
+    runtime_script="$runtime/e1-doom-runtime-override"
+fi
+for file in e1-doom-injector \
+    e1-injected-supervisor e1-ptz-patch-supervisor \
+    e1-ptz-hook-owner-dummy e1-audio-device-deadman \
+    e1-ptz-device-deadman e1-injected-finalize \
+    e1-runtime-watchdog e1-osg-snapshot; do
+    ln -s "$root/bin/$file" "$runtime/$file" || exit 1
+done
+
+E1_DOOM_ROOT="$root" E1_DOOM_BINARY="$game_binary" \
+    /bin/sh "$runtime_script" &
+child=$!
+child_started=1
+
+forward_stop()
+{
+    test -n "$child" && /bin/kill -TERM "$child" 2>/dev/null || true
+}
+trap forward_stop INT TERM HUP
+
+wait "$child"
+status=$?
+trap - INT TERM HUP
+
+# A killed coordinator cannot write runtime-restored, so give the already-armed
+# detached watchdog time to run both proven deadmen and leave its completion
+# marker.  The exact checks below remain authoritative.
+recovery_wait=0
+while test ! -f "$state/runtime-restored" &&
+      test ! -f "$state/runtime-recovery.complete" &&
+      test "$recovery_wait" -lt 45; do
+    /bin/sleep 1
+    recovery_wait=$((recovery_wait + 1))
+done
+
+device_pid=$(/bin/pidof device 2>/dev/null || true)
+if { test -f "$state/runtime-restored" ||
+     test -f "$state/runtime-recovery.complete"; } &&
+   test -n "$device_pid" &&
+   ! grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps" &&
+   test ! -f "$state/audio.patch.active" &&
+   test ! -f "$state/ptz.patch.active"; then
+    safe=1
+else
+    safe=0
+fi
+
+if test "$safe" -ne 1; then
+    echo "runtime recovery is still active; leaving runtime for inspection" >&2
+    exit 1
+fi
+
+remove_runtime_files
+rmdir "$runtime"
+rm -f "$lock"
+trap - EXIT
+exit "$status"

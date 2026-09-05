@@ -1,0 +1,91 @@
+#!/bin/sh
+# shellcheck disable=SC2016,SC2100
+# Host-side camera liveness recorder and pre-watchdog abort.  This intentionally
+# keeps its evidence off-camera so an abrupt tmpfs reset cannot erase it.
+set -u
+
+tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+ssh="$tool_dir/e1-ssh"
+duration=${1:-60}
+log_file=${2:-"$tool_dir/../.state/e1-safety-monitor.log"}
+interval=${E1_MONITOR_INTERVAL:-1}
+abort_enabled=${E1_MONITOR_ABORT:-1}
+
+case "$duration" in
+    ''|*[!0-9]*) echo "usage: $0 [seconds] [log-file]" >&2; exit 2 ;;
+esac
+test "$duration" -ge 1 || exit 2
+mkdir -p "$(dirname -- "$log_file")"
+
+remote_sample='set -- $(pidof device) $(pidof router) $(pidof rtsp) $(pidof recorder); device=$1; router=$2; rtsp=$3; recorder=$4; boot=$(cat /proc/sys/kernel/random/boot_id); uptime=$(cut -d" " -f1 /proc/uptime); wdt=$(cat /sys/class/watchdog/watchdog0/timeleft 2>/dev/null || echo -1); starts=$(grep -c START /proc/hdal/venc/info 2>/dev/null || echo 0); mapped=0; grep -q e1-doom-injected.so /proc/$device/maps 2>/dev/null && mapped=1; mode=$(head -n 1 /mnt/tmp/e1-doom/state/runtime.mode 2>/dev/null || echo stock); media=$(head -n 1 /mnt/tmp/e1-doom/state/media.active 2>/dev/null || echo none); audio=$(head -n 1 /mnt/tmp/e1-doom/state/audio.active 2>/dev/null || echo none); printf "epoch=%s boot=%s uptime=%s wdt=%s device=%s router=%s rtsp=%s recorder=%s starts=%s mapped=%s mode=%s media=%s audio=%s" "$(date +%s)" "$boot" "$uptime" "$wdt" "$device" "$router" "$rtsp" "$recorder" "$starts" "$mapped" "$mode" "$media" "$audio"; for name in bc_avencoder bc_audio bc_osd; do tid=; for task in /proc/$device/task/*; do test "$(cat $task/comm 2>/dev/null)" = "$name" && tid=${task##*/} && break; done; if test -n "$tid"; then awk -v n="$name" "{printf \" %s_tid=%s %s_state=%s %s_ticks=%u\", n, \$1, n, \$3, n, \$14+\$15}" /proc/$device/task/$tid/stat; else printf " %s_tid=none" "$name"; fi; done; printf "\n"'
+
+abort_runtime()
+{
+    "$ssh" 'state=/mnt/tmp/e1-doom/state; if test -s "$state/launcher.pid"; then pid=$(head -n 1 "$state/launcher.pid"); case $(tr "\000" " " </proc/$pid/cmdline 2>/dev/null || true) in *e1-doom-run*) kill -TERM "$pid" 2>/dev/null || true;; esac; fi' >/dev/null 2>&1 || true
+}
+
+started=$(date +%s)
+deadline=$((started + duration))
+baseline_boot=
+baseline_device=
+previous_wdt=
+declines=0
+failures=0
+alarm=
+
+printf '# e1-safety-monitor host_started=%s duration=%s\n' "$started" "$duration" >"$log_file"
+while test "$(date +%s)" -lt "$deadline"; do
+    sample=$($ssh "$remote_sample" 2>/dev/null) || sample=
+    host_now=$(date +%s)
+    if test -z "$sample"; then
+        failures=$((failures + 1))
+        printf 'host_epoch=%s ssh_error=%s\n' "$host_now" "$failures" >>"$log_file"
+        if test "$failures" -ge 5; then
+            alarm=ssh-unreachable
+            break
+        fi
+        sleep "$interval"
+        continue
+    fi
+    failures=0
+    printf 'host_epoch=%s %s\n' "$host_now" "$sample" >>"$log_file"
+    boot=$(printf '%s\n' "$sample" | sed -n 's/.* boot=\([^ ]*\).*/\1/p')
+    device=$(printf '%s\n' "$sample" | sed -n 's/.* device=\([^ ]*\).*/\1/p')
+    wdt=$(printf '%s\n' "$sample" | sed -n 's/.* wdt=\([^ ]*\).*/\1/p')
+    starts=$(printf '%s\n' "$sample" | sed -n 's/.* starts=\([^ ]*\).*/\1/p')
+    test -n "$baseline_boot" || baseline_boot=$boot
+    test -n "$baseline_device" || baseline_device=$device
+    if test "$boot" != "$baseline_boot"; then alarm=boot-changed; break; fi
+    if test "$device" != "$baseline_device"; then alarm=device-changed; break; fi
+    if test "$starts" != 4; then alarm=encoder-path-loss; break; fi
+    case "$wdt:$previous_wdt" in
+        *[!0-9:]*|:*) declines=0 ;;
+        *)
+            if test -n "$previous_wdt" && test "$wdt" -lt "$previous_wdt"; then
+                declines=$((declines + 1))
+            else
+                declines=0
+            fi
+            ;;
+    esac
+    previous_wdt=$wdt
+    if test "$declines" -ge 5 && test "$wdt" -le 52; then
+        alarm=watchdog-feed-stopped
+        break
+    fi
+    sleep "$interval"
+done
+
+if test -n "$alarm"; then
+    printf '# alarm=%s host_epoch=%s abort_enabled=%s\n' \
+        "$alarm" "$(date +%s)" "$abort_enabled" >>"$log_file"
+    if test "$abort_enabled" = 1; then
+        abort_runtime
+        printf '# abort-requested host_epoch=%s\n' "$(date +%s)" >>"$log_file"
+    fi
+    echo "e1-safety-monitor: $alarm; evidence: $log_file" >&2
+    exit 1
+fi
+
+printf '# complete host_epoch=%s\n' "$(date +%s)" >>"$log_file"
+echo "e1-safety-monitor: healthy; evidence: $log_file"

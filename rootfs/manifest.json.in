@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "build_timestamp": 0,
+  "target": "arm-linux-gnueabihf.2.34 cortex-a7 hard-float",
+  "compatibility": "semantic-signatures-v1",
+  "woof_commit": "@WOOF_COMMIT@",
+  "rp2040_doom_commit": "@RP2040_DOOM_COMMIT@",
+  "files": {
+    "bin/e1-doom": "@DOOM_HASH@",
+    "bin/e1-doom-controller": "@CONTROLLER_HASH@",
+    "bin/e1-doom-injected.so": "@INJECTED_HASH@",
+    "bin/woof.pk3": "@WOOF_DATA_HASH@",
+    "share/doom/doom1.wad": "@IWAD_HASH@"
+  }
+}

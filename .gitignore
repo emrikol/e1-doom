@@ -1,0 +1,11 @@
+.deps/
+.state/
+.target-abi/
+build/
+dist/
+compile_commands.json
+__pycache__/
+*.py[cod]
+*.wad
+*.WAD
+*.sqfs

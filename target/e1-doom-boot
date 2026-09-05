@@ -1,0 +1,215 @@
+#!/bin/sh
+# Persistent-root service for the lightweight E1 Doom listener/dashboard.
+# Doom itself remains on demand. All injected state remains in tmpfs.
+set -u
+
+card=${E1_DOOM_CARD:-/mnt/sda}
+runtime=${E1_DOOM_RUNTIME:-/mnt/tmp/e1-doom}
+boot_state=${E1_DOOM_BOOT_STATE:-/mnt/tmp/e1-doom-boot}
+launcher=${E1_DOOM_LAUNCHER:-$card/e1-doom-run}
+flat_root=${E1_DOOM_ROOT:-$card/e1-doom-flat}
+enabled_marker=${E1_DOOM_AUTOSTART_MARKER:-$card/.e1-doom-autostart-enabled}
+reservation=${E1_COMPATIBILITY_RESERVATION:-$card/.e1-compatibility-reserved}
+paused_reservation=${E1_COMPATIBILITY_PAUSED_RESERVATION:-$card/.e1-compatibility-reserved.paused-by-e1-doom-autostart}
+log=${E1_DOOM_BOOT_LOG:-$card/e1-doom-autostart.log}
+pidfile=$boot_state/launcher.pid
+boot_script=$0
+
+owned_pid()
+{
+    owned=$1
+    case "$owned" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    /bin/kill -0 "$owned" 2>/dev/null || return 1
+    if test "${E1_DOOM_TEST_PIDFILE_ONLY:-0}" = 1; then
+        return 0
+    fi
+    test -r "/proc/$owned/cmdline" || return 1
+    command_line=$(/usr/bin/tr '\000' ' ' <"/proc/$owned/cmdline")
+    case "$command_line" in
+        *"$launcher"*|*"$boot_script"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+read_pid()
+{
+    test -s "$pidfile" || return 1
+    /usr/bin/head -n 1 "$pidfile"
+}
+
+device_ready()
+{
+    if test -n "${E1_DOOM_DEVICE_READY_FILE:-}"; then
+        test -f "$E1_DOOM_DEVICE_READY_FILE"
+    else
+        device_pid=$(/bin/pidof device 2>/dev/null || true)
+        test -n "$device_pid"
+    fi
+}
+
+validate_inputs()
+{
+    test -e "$enabled_marker" || {
+        echo "E1 Doom boot arming is disabled: $enabled_marker is absent" >&2
+        return 1
+    }
+    test ! -e "$reservation" || {
+        echo "E1 Doom boot arming refused: compatibility reservation is active" >&2
+        return 1
+    }
+    test -s "$launcher" || return 1
+    test -d "$flat_root/bin" || return 1
+    test -x "$flat_root/bin/e1-doom-controller" || return 1
+    test -x "$flat_root/bin/e1-doom" || return 1
+    test -s "$flat_root/share/doom/doom1.wad" || return 1
+}
+
+claim_camera()
+{
+    test -e "$enabled_marker" || {
+        echo "E1 Doom boot arming is disabled: $enabled_marker is absent" >&2
+        return 1
+    }
+    if test -e "$reservation"; then
+        # The enable marker is the owner's explicit handoff to E1 Doom. Move
+        # the compatibility marker so both projects never advertise ownership.
+        /bin/mv -f "$reservation" "$paused_reservation" || return 1
+        sync
+    fi
+}
+
+start_service()
+{
+    claim_camera || return 1
+    if test -f "$runtime/state/runtime.active"; then
+        active_pid=$(/usr/bin/head -n 1 "$runtime/state/launcher.pid" 2>/dev/null || true)
+        if owned_pid "$active_pid"; then
+            echo "E1 Doom listener already active (pid $active_pid)"
+            return 0
+        fi
+    fi
+
+    validate_inputs || return 1
+    if test -e "$runtime"; then
+        echo "E1 Doom boot arming refused: $runtime requires inspection" >&2
+        return 1
+    fi
+
+    /bin/mkdir -p "$boot_state" || return 1
+    old_pid=$(read_pid 2>/dev/null || true)
+    if owned_pid "$old_pid"; then
+        echo "E1 Doom boot worker already active (pid $old_pid)"
+        return 0
+    fi
+    /bin/rm -f "$pidfile"
+
+    if test -f "$log"; then
+        /bin/mv -f "$log" "$log.previous" || return 1
+    fi
+
+    (
+        trap '' HUP
+        exec </dev/null >>"$log" 2>&1
+        boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+        echo "E1 Doom boot worker: boot=$boot_id"
+
+        wait_count=0
+        while test "$wait_count" -lt 60 && ! device_ready; do
+            /bin/sleep 0.5
+            wait_count=$((wait_count + 1))
+        done
+        if ! device_ready; then
+            echo "E1 Doom boot worker: stock device did not become ready"
+            exit 1
+        fi
+
+        # Recheck ownership and payloads after the readiness wait. A competing
+        # project can reclaim the camera by restoring its reservation marker.
+        validate_inputs || exit 1
+        test ! -e "$runtime" || {
+            echo "E1 Doom boot worker: runtime appeared during readiness wait"
+            exit 1
+        }
+
+        echo "E1 Doom boot worker: arming listener and dashboard"
+        E1_DOOM_ROOT="$flat_root" exec /bin/sh "$launcher"
+    ) &
+    service_pid=$!
+    echo "$service_pid" >"$pidfile"
+    echo "E1 Doom boot worker started (pid $service_pid)"
+}
+
+stop_service()
+{
+    service_pid=$(read_pid 2>/dev/null || true)
+    runtime_pid=$(/usr/bin/head -n 1 "$runtime/state/launcher.pid" 2>/dev/null || true)
+    stop_pid=$runtime_pid
+    if ! owned_pid "$stop_pid"; then
+        stop_pid=$service_pid
+    fi
+    if ! owned_pid "$stop_pid"; then
+        /bin/rm -f "$pidfile"
+        test ! -e "$runtime" || {
+            echo "E1 Doom listener has no owned launcher, but runtime remains" >&2
+            return 1
+        }
+        echo "E1 Doom listener is stopped"
+        return 0
+    fi
+
+    /bin/kill -TERM "$stop_pid" || return 1
+    wait_count=0
+    while test "$wait_count" -lt 600 && owned_pid "$stop_pid"; do
+        /bin/sleep 0.1
+        wait_count=$((wait_count + 1))
+    done
+    if owned_pid "$stop_pid"; then
+        echo "E1 Doom listener did not stop within 60 seconds" >&2
+        return 1
+    fi
+    /bin/rm -f "$pidfile"
+    test ! -e "$runtime" || {
+        echo "E1 Doom launcher exited, but runtime recovery is incomplete" >&2
+        return 1
+    }
+    echo "E1 Doom listener stopped; camera runtime is stock"
+}
+
+status_service()
+{
+    runtime_pid=$(/usr/bin/head -n 1 "$runtime/state/launcher.pid" 2>/dev/null || true)
+    if owned_pid "$runtime_pid" && test -f "$runtime/state/runtime.active"; then
+        mode=$(/usr/bin/head -n 1 "$runtime/state/runtime.mode" 2>/dev/null || echo unknown)
+        echo "active pid=$runtime_pid mode=$mode"
+        return 0
+    fi
+    service_pid=$(read_pid 2>/dev/null || true)
+    if owned_pid "$service_pid"; then
+        echo "starting pid=$service_pid"
+        return 0
+    fi
+    if test -e "$runtime"; then
+        echo "failed runtime=$runtime"
+        return 1
+    fi
+    if test ! -e "$enabled_marker"; then
+        echo disabled
+        return 3
+    fi
+    if test -e "$reservation"; then
+        echo reserved
+        return 3
+    fi
+    echo stopped
+    return 3
+}
+
+case ${1:-} in
+    start) start_service ;;
+    stop) stop_service ;;
+    restart) stop_service && start_service ;;
+    status) status_service ;;
+    *) echo "usage: $0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac

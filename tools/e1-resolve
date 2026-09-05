@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Resolve the E1 Doom camera without depending on a DHCP address."""
+
+from __future__ import annotations
+
+import concurrent.futures
+import ipaddress
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+STATE_DIR = Path(os.environ.get("E1_DOOM_HOST_STATE", PROJECT_DIR / ".state"))
+PORT = int(os.environ.get("E1_DOOM_SSH_PORT", "22222"))
+CACHE_PATH = STATE_DIR / "e1_host"
+CAMERA_KNOWN_HOSTS = STATE_DIR / "e1_camera_known_hosts"
+KNOWN_MACS = {
+    value.strip().lower()
+    for value in os.environ.get("E1_DOOM_MACS", "").split(",")
+    if re.fullmatch(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}", value.strip())
+}
+IDENTITY_COMMAND = (
+    "test -f /mnt/sda/e1-doom-run && "
+    "test -x /mnt/sda/e1-doom-flat/bin/e1-doom-probe && "
+    "/mnt/sda/e1-doom-flat/bin/e1-doom-probe 2>/dev/null "
+    "| /bin/busybox grep -q '^build_id=e1-doom-probe-v1$' && "
+    "echo E1_DOOM_CAMERA"
+)
+
+
+def valid_host(value: str) -> bool:
+    try:
+        return not ipaddress.ip_address(value).is_unspecified
+    except ValueError:
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", value))
+
+
+def append_unique(items: list[str], value: str | None) -> None:
+    if value and valid_host(value) and value not in items:
+        items.append(value)
+
+
+def arp_candidates() -> list[str]:
+    try:
+        output = subprocess.run(
+            ["/usr/sbin/arp", "-an"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    result: list[str] = []
+    pattern = re.compile(r"\(([^)]+)\) at ([0-9a-f:]+)", re.IGNORECASE)
+    for host, mac in pattern.findall(output):
+        if mac.lower() in KNOWN_MACS:
+            append_unique(result, host)
+    return result
+
+
+def local_networks() -> list[ipaddress.IPv4Network]:
+    try:
+        output = subprocess.run(
+            ["/sbin/ifconfig"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        output = ""
+
+    networks: list[ipaddress.IPv4Network] = []
+    pattern = re.compile(r"\binet (\d+(?:\.\d+){3}) netmask (0x[0-9a-f]+)", re.I)
+    for address, mask_text in pattern.findall(output):
+        ip = ipaddress.IPv4Address(address)
+        if ip.is_loopback or not ip.is_private:
+            continue
+        mask = int(mask_text, 16)
+        prefix = mask.bit_count()
+        network = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+        if network.num_addresses > 4096:
+            network = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+        if network not in networks:
+            networks.append(network)
+    return networks
+
+
+def port_open(host: str) -> bool:
+    try:
+        with socket.create_connection((host, PORT), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def scan_root_hosts() -> list[str]:
+    hosts: list[str] = []
+    for network in local_networks():
+        hosts.extend(str(host) for host in network.hosts())
+    if not hosts:
+        return []
+
+    result: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=192) as executor:
+        for host, opened in zip(hosts, executor.map(port_open, hosts)):
+            if opened:
+                result.append(host)
+    return result
+
+
+def scan_key(host: str) -> tuple[str, str] | None:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/ssh-keyscan", "-T", "2", "-p", str(PORT), host],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    keys: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[1].startswith("ssh-"):
+            keys.append((fields[1], fields[2]))
+    for key in keys:
+        if key[0] == "ssh-ed25519":
+            return key
+    return keys[0] if keys else None
+
+
+def verify_identity(host: str, key: tuple[str, str]) -> bool:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="e1-probe-known-hosts.", dir=STATE_DIR
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as output:
+            output.write(f"e1-doom-probe {key[0]} {key[1]}\n")
+        command = [
+            "/usr/bin/ssh",
+            "-T",
+            "-p",
+            str(PORT),
+            "-o",
+            "HostKeyAlias=e1-doom-probe",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "PreferredAuthentications=none",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={temporary}",
+            "-o",
+            "ConnectTimeout=3",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "ControlMaster=no",
+            f"root@{host}",
+            IDENTITY_COMMAND,
+        ]
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=6,
+        )
+        return result.returncode == 0 and "E1_DOOM_CAMERA" in result.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def save_identity(host: str, key: tuple[str, str]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    host_temporary = CACHE_PATH.with_suffix(".tmp")
+    key_temporary = CAMERA_KNOWN_HOSTS.with_suffix(".tmp")
+    host_temporary.write_text(f"{host}\n", encoding="ascii")
+    key_temporary.write_text(
+        f"e1-doom-camera {key[0]} {key[1]}\n", encoding="ascii"
+    )
+    os.chmod(key_temporary, 0o600)
+    os.replace(host_temporary, CACHE_PATH)
+    os.replace(key_temporary, CAMERA_KNOWN_HOSTS)
+
+
+def saved_key() -> tuple[str, str] | None:
+    try:
+        fields = CAMERA_KNOWN_HOSTS.read_text(encoding="ascii").split()
+    except OSError:
+        return None
+    if len(fields) == 3 and fields[0] == "e1-doom-camera":
+        return fields[1], fields[2]
+    return None
+
+
+def candidate_hosts() -> list[str]:
+    candidates: list[str] = []
+    append_unique(candidates, os.environ.get("E1_DOOM_HOST"))
+    try:
+        append_unique(candidates, CACHE_PATH.read_text(encoding="ascii").strip())
+    except OSError:
+        pass
+    for host in arp_candidates():
+        append_unique(candidates, host)
+    if not any(port_open(host) for host in candidates):
+        for host in scan_root_hosts():
+            append_unique(candidates, host)
+    else:
+        # A cached address can now belong to another device. Keep scanning if
+        # the cheap candidates fail identity verification below.
+        pass
+    return candidates
+
+
+def main() -> int:
+    if os.environ.get("E1_DOOM_RESOLVE_REFRESH") != "1":
+        try:
+            cached = CACHE_PATH.read_text(encoding="ascii").strip()
+        except OSError:
+            cached = ""
+        key = saved_key()
+        if cached and key is not None:
+            if cached in arp_candidates() or (port_open(cached) and scan_key(cached) == key):
+                print(cached)
+                return 0
+
+    tried: set[str] = set()
+    initial = candidate_hosts()
+    pending = list(initial)
+    scanned = False
+    while pending:
+        host = pending.pop(0)
+        if host in tried or not port_open(host):
+            continue
+        tried.add(host)
+        key = scan_key(host)
+        if key is not None and verify_identity(host, key):
+            save_identity(host, key)
+            print(host)
+            return 0
+        if not pending and not scanned:
+            scanned = True
+            for found in scan_root_hosts():
+                if found not in tried:
+                    pending.append(found)
+
+    print(
+        "E1 Doom camera not found: checked explicit/cached hosts, configured MACs, and local root services",
+        file=sys.stderr,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

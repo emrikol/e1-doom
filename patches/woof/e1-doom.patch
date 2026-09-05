@@ -1,0 +1,869 @@
+diff --git a/opl/opl.h b/opl/opl.h
+index 94a122d..b776d9d 100644
+--- a/opl/opl.h
++++ b/opl/opl.h
+@@ -1,5 +1,6 @@
+ //
+ // Copyright(C) 2005-2014 Simon Howard
++// Modified for E1 Doom, 2026.
+ //
+ // This program is free software; you can redistribute it and/or
+ // modify it under the terms of the GNU General Public License
+@@ -38,7 +39,9 @@ typedef enum
+     OPL_REGISTER_PORT_OPL3 = 2
+ } opl_port_t;
+ 
++#ifndef OPL_SAMPLE_RATE
+ #define OPL_SAMPLE_RATE     49716
++#endif
+ #define OPL_MAX_CHIPS       6
+ 
+ #define OPL_NUM_OPERATORS   21
+@@ -134,4 +137,3 @@ void OPL_SetPaused(int paused);
+ int OPL_FillBuffer(unsigned char *buffer, int buffer_samples);
+ 
+ #endif
+-
+diff --git a/opl/opl3.c b/opl/opl3.c
+index 927bda3..f53659f 100644
+--- a/opl/opl3.c
++++ b/opl/opl3.c
+@@ -1,5 +1,6 @@
+ //
+ // Copyright (C) 2013-2018 Alexey Khokholov (Nuke.YKT)
++// Modified for E1 Doom, 2026.
+ //
+ // This program is free software; you can redistribute it and/or
+ // modify it under the terms of the GNU General Public License
+@@ -28,9 +29,18 @@
+ 
+ #include <string.h>
+ #include "opl3.h"
++#include "e1-opl2-noise.h"
+ 
+ #define RSM_FRAC    10
+ 
++#ifndef E1_OPL2_FAST_PATH
++#define E1_OPL2_FAST_PATH 1
++#endif
++
++#ifndef E1_OPL2_ONLY
++#define E1_OPL2_ONLY 0
++#endif
++
+ // Channel types
+ 
+ enum {
+@@ -355,7 +365,8 @@ static void OPL3_EnvelopeUpdateKSL(opl3_slot *slot)
+     slot->eg_ksl = (Bit8u)ksl;
+ }
+ 
+-static void OPL3_EnvelopeCalc(opl3_slot *slot)
++static void
++OPL3_EnvelopeCalc(opl3_slot *slot)
+ {
+     Bit8u nonzero;
+     Bit8u rate;
+@@ -370,6 +381,20 @@ static void OPL3_EnvelopeCalc(opl3_slot *slot)
+     Bit8u reset = 0;
+     slot->eg_out = slot->eg_rout + (slot->reg_tl << 2)
+                  + (slot->eg_ksl >> kslshift[slot->reg_ksl]) + *slot->trem;
++#if E1_OPL2_FAST_PATH
++    /*
++     * A released OPL2 operator at maximum attenuation is stationary until a
++     * register write keys it on again.  Keep eg_out current, but avoid the
++     * full envelope-rate state machine for the common idle-voice case.
++     */
++    if ((E1_OPL2_ONLY || !slot->chip->newm) && !slot->key
++        && slot->eg_gen == envelope_gen_num_release
++        && slot->eg_rout == 0x1ff)
++    {
++        slot->pg_reset = 0;
++        return;
++    }
++#endif
+     if (slot->key && slot->eg_gen == envelope_gen_num_release)
+     {
+         reset = 1;
+@@ -516,7 +541,8 @@ static void OPL3_EnvelopeKeyOff(opl3_slot *slot, Bit8u type)
+ // Phase Generator
+ //
+ 
+-static void OPL3_PhaseGenerate(opl3_slot *slot)
++static void
++OPL3_PhaseGenerate(opl3_slot *slot)
+ {
+     opl3_chip *chip;
+     Bit16u f_num;
+@@ -660,6 +686,18 @@ static void OPL3_SlotWriteE0(opl3_slot *slot, Bit8u data)
+ 
+ static void OPL3_SlotGenerate(opl3_slot *slot)
+ {
++#if E1_OPL2_FAST_PATH
++    if ((E1_OPL2_ONLY || !slot->chip->newm) && slot->eg_out >= 0x1ff)
++    {
++        /*
++         * At this attenuation CalcExp is zero.  OPL2 waveforms 1-3 stay
++         * zero; waveform 0 XORs the negative half-cycle into -1.
++         */
++        Bit16u phase = slot->pg_phase_out + *slot->mod;
++        slot->out = slot->reg_wf == 0 && (phase & 0x200) ? -1 : 0;
++        return;
++    }
++#endif
+     slot->out = envelope_sin[slot->reg_wf](slot->pg_phase_out + *slot->mod, slot->eg_out);
+ }
+ 
+@@ -1046,8 +1084,17 @@ void OPL3_Generate(opl3_chip *chip, Bit16s *buf)
+     Bit8u ii;
+     Bit8u jj;
+     Bit16s accm;
++    Bit8u channel_count;
+     Bit8u shift = 0;
+ 
++#if E1_OPL2_ONLY
++    channel_count = 9;
++#elif E1_OPL2_FAST_PATH
++    channel_count = chip->newm ? 18 : 9;
++#else
++    channel_count = 18;
++#endif
++
+     buf[1] = OPL3_ClipSample(chip->mixbuff[1]);
+ 
+     for (ii = 0; ii < 15; ii++)
+@@ -1059,7 +1106,10 @@ void OPL3_Generate(opl3_chip *chip, Bit16s *buf)
+     }
+ 
+     chip->mixbuff[0] = 0;
+-    for (ii = 0; ii < 18; ii++)
++#if E1_OPL2_ONLY && defined(__clang__)
++#pragma clang loop unroll(disable)
++#endif
++    for (ii = 0; ii < channel_count; ii++)
+     {
+         accm = 0;
+         for (jj = 0; jj < 4; jj++)
+@@ -1069,6 +1119,9 @@ void OPL3_Generate(opl3_chip *chip, Bit16s *buf)
+         chip->mixbuff[0] += (Bit16s)(accm & chip->channel[ii].cha);
+     }
+ 
++#if E1_OPL2_ONLY && defined(__clang__)
++#pragma clang loop unroll(disable)
++#endif
+     for (ii = 15; ii < 18; ii++)
+     {
+         OPL3_SlotCalcFB(&chip->slot[ii]);
+@@ -1079,16 +1132,32 @@ void OPL3_Generate(opl3_chip *chip, Bit16s *buf)
+ 
+     buf[0] = OPL3_ClipSample(chip->mixbuff[0]);
+ 
+-    for (ii = 18; ii < 33; ii++)
++#if E1_OPL2_ONLY
++    chip->noise = e1_opl2_noise_advance_18(chip->noise);
++#else
++#if E1_OPL2_FAST_PATH
++    if (!chip->newm)
+     {
+-        OPL3_SlotCalcFB(&chip->slot[ii]);
+-        OPL3_EnvelopeCalc(&chip->slot[ii]);
+-        OPL3_PhaseGenerate(&chip->slot[ii]);
+-        OPL3_SlotGenerate(&chip->slot[ii]);
++        chip->noise = e1_opl2_noise_advance_18(chip->noise);
+     }
++    else
++#endif
++    {
++        for (ii = 18; ii < 33; ii++)
++        {
++            OPL3_SlotCalcFB(&chip->slot[ii]);
++            OPL3_EnvelopeCalc(&chip->slot[ii]);
++            OPL3_PhaseGenerate(&chip->slot[ii]);
++            OPL3_SlotGenerate(&chip->slot[ii]);
++        }
++    }
++#endif
+ 
+     chip->mixbuff[1] = 0;
+-    for (ii = 0; ii < 18; ii++)
++#if E1_OPL2_ONLY && defined(__clang__)
++#pragma clang loop unroll(disable)
++#endif
++    for (ii = 0; ii < channel_count; ii++)
+     {
+         accm = 0;
+         for (jj = 0; jj < 4; jj++)
+@@ -1098,13 +1167,20 @@ void OPL3_Generate(opl3_chip *chip, Bit16s *buf)
+         chip->mixbuff[1] += (Bit16s)(accm & chip->channel[ii].chb);
+     }
+ 
+-    for (ii = 33; ii < 36; ii++)
++#if !E1_OPL2_ONLY
++#if E1_OPL2_FAST_PATH
++    if (chip->newm)
++#endif
+     {
+-        OPL3_SlotCalcFB(&chip->slot[ii]);
+-        OPL3_EnvelopeCalc(&chip->slot[ii]);
+-        OPL3_PhaseGenerate(&chip->slot[ii]);
+-        OPL3_SlotGenerate(&chip->slot[ii]);
++        for (ii = 33; ii < 36; ii++)
++        {
++            OPL3_SlotCalcFB(&chip->slot[ii]);
++            OPL3_EnvelopeCalc(&chip->slot[ii]);
++            OPL3_PhaseGenerate(&chip->slot[ii]);
++            OPL3_SlotGenerate(&chip->slot[ii]);
++        }
+     }
++#endif
+ 
+     if ((chip->timer & 0x3f) == 0x3f)
+     {
+diff --git a/opl/opl_sdl.c b/opl/opl_sdl.c
+index 458c3aa..94bbb91 100644
+--- a/opl/opl_sdl.c
++++ b/opl/opl_sdl.c
+@@ -1,5 +1,6 @@
+ //
+ // Copyright(C) 2005-2014 Simon Howard
++// Modified for E1 Doom, 2026.
+ //
+ // This program is free software; you can redistribute it and/or
+ // modify it under the terms of the GNU General Public License
+@@ -15,19 +16,24 @@
+ //     OPL SDL interface.
+ //
+ 
++#include <assert.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "doomtype.h"
++#include "emu8950.h"
+ #include "opl.h"
+-#include "opl3.h"
+ #include "opl_internal.h"
+ #include "opl_queue.h"
+ 
+ #define MAX_SOUND_SLICE_TIME 100 /* ms */
+ 
+-#define OPL_SILENCE_THRESHOLD   36  // Allow for a worst case of +/-1 ripple in all 36 operators.
+-#define OPL_CHIP_TIMEOUT        (OPL_SAMPLE_RATE / 2)   // 0.5 seconds of silence with no key-on
+-                                                        // should be enough to ensure chip is "off"
++#define E1_OPL_CLOCK_HZ 3579552U
++#define E1_OPL_NATIVE_RATE (E1_OPL_CLOCK_HZ / 72U)
++#define E1_OPL_ENGINE_RATE (E1_OPL_NATIVE_RATE / EMU8950_SAMPLE_STRIDE)
++#define E1_OPL_OUTPUT_BLOCK 256U
++#define E1_OPL_NATIVE_BLOCK \
++    ((E1_OPL_ENGINE_RATE * E1_OPL_OUTPUT_BLOCK) / OPL_SAMPLE_RATE + 1U)
+ 
+ typedef struct
+ {
+@@ -54,11 +60,12 @@ static int opl_sdl_paused;
+ 
+ static uint64_t pause_offset;
+ 
+-// OPL software emulator structure.
++// The E1 build is deliberately OPL2-only and uses one block-linear chip.
+ 
+-static opl3_chip opl_chips[OPL_MAX_CHIPS];
+-static uint32_t opl_chip_keys[OPL_MAX_CHIPS];
+-static uint32_t opl_chip_timeouts[OPL_MAX_CHIPS];
++static OPL *opl_chip;
++static int32_t opl_native_buffer[E1_OPL_NATIVE_BLOCK];
++static uint32_t opl_source_remainder;
++static int16_t opl_previous_sample;
+ static int opl_opl3mode;
+ 
+ // Register number that was written.
+@@ -70,8 +77,6 @@ static int register_num = 0;
+ static opl_timer_t timer1 = { 12500, 0, 0, 0 };
+ static opl_timer_t timer2 = { 3125, 0, 0, 0 };
+ 
+-static int mixing_channels;
+-
+ // Advance time by the specified number of samples, invoking any
+ // callback functions as appropriate.
+ 
+@@ -109,34 +114,46 @@ static void AdvanceTime(unsigned int nsamples)
+ }
+ 
+ 
+-// When a chip is re-activated after being idle, we need to bring its
+-// internal global timers back into synch with the main chip to avoid
+-// possible beating artifacts
+-
+-static void ResyncChip (int chip)
++/* Render at the reduced OPL engine rate in cache-friendly blocks, then hold
++ * each source sample across the camera's 16 kHz mono contract.  The phase
++ * remainder is continuous across MIDI callback slices. */
++static void GenerateOutput(int16_t *output, unsigned int output_samples)
+ {
+-    // Find an active chip to synchronize with; will usually be chip 0
+-    int sync = -1;
+-    for (int c = 0; c < OPL_MAX_CHIPS; ++c)
++    while (output_samples != 0U)
+     {
+-        if (opl_chip_timeouts[c] < OPL_CHIP_TIMEOUT)
++        unsigned int count = MIN(output_samples, E1_OPL_OUTPUT_BLOCK);
++        uint32_t phase = opl_source_remainder;
++        uint64_t requested = phase +
++            (uint64_t)E1_OPL_ENGINE_RATE * count;
++        unsigned int native_samples =
++            (unsigned int)(requested / OPL_SAMPLE_RATE);
++        unsigned int native_index = 0;
++
++        OPL_calc_buffer_stereo(opl_chip, opl_native_buffer, native_samples);
++        for (unsigned int sample = 0; sample < count; ++sample)
+         {
+-            sync = c;
+-            break;
++            int32_t sum = 0;
++            unsigned int begin = native_index;
++            unsigned int source_count;
++
++            phase += E1_OPL_ENGINE_RATE;
++            native_index += phase / OPL_SAMPLE_RATE;
++            phase %= OPL_SAMPLE_RATE;
++            source_count = native_index - begin;
++            if (source_count != 0U)
++            {
++                while (begin < native_index)
++                {
++                    sum += (int16_t)(uint16_t)opl_native_buffer[begin++];
++                }
++                opl_previous_sample = (int16_t)(sum / (int32_t)source_count);
++            }
++            output[0] = output[1] = opl_previous_sample;
++            output += 2;
+         }
+-    }
+-
+-    if (sync >= 0)
+-    {
+-        // Synchronize the LFOs
+-        opl_chips[chip].vibpos = opl_chips[sync].vibpos;
+-        opl_chips[chip].tremolopos = opl_chips[sync].tremolopos;
+-        opl_chips[chip].timer = opl_chips[sync].timer;
+-
+-        // Synchronize the envelope clock
+-        opl_chips[chip].eg_state = opl_chips[sync].eg_state;
+-        opl_chips[chip].eg_timer = opl_chips[sync].eg_timer;
+-        opl_chips[chip].eg_timerrem = opl_chips[sync].eg_timerrem;
++        assert(native_index == native_samples);
++        opl_source_remainder = phase;
++        output_samples -= count;
+     }
+ }
+ 
+@@ -177,49 +194,9 @@ int OPL_FillBuffer(byte *buffer, int buffer_samples)
+             }
+         }
+ 
+-        // Add emulator output to buffer.
+-        Bit16s *cursor = (Bit16s *)(buffer + filled * 4);
+-        for (int s = 0; s < nsamples; ++s)
+-        {
+-            // Check for chip activations before we generate the sample
+-            for (int c = 0; c < num_opl_chips; ++c)
+-            {
+-                // Reset chip timeout if any channels are active
+-                if (opl_chip_keys[c])
+-                {
+-                    // Resync is necessary if the chip was idle
+-                    if (opl_chip_timeouts[c] >= OPL_CHIP_TIMEOUT)
+-                        ResyncChip(c);
+-                    opl_chip_timeouts[c] = 0;
+-                }
+-            }
+-
+-            // Generate a sample from each chip and mix them
+-            Bit32s mix[2] = {0, 0};
+-            for (int c = 0; c < num_opl_chips; ++c)
+-            {
+-                // Run the chip if it's active or if it has pending register writes
+-                if (opl_chip_timeouts[c] < OPL_CHIP_TIMEOUT || (opl_chips[c].writebuf[opl_chips[c].writebuf_cur].reg & 0x200))
+-                {
+-                    Bit16s sample[2];
+-                    OPL3_Generate(&opl_chips[c], sample);
+-                    mix[0] += sample[0];
+-                    mix[1] += sample[1];
+-
+-                    // Reset chip timeout if it breaks the silence threshold
+-                    if (MAX(abs(sample[0]), abs(sample[1])) > OPL_SILENCE_THRESHOLD)
+-                        opl_chip_timeouts[c] = 0;
+-                    else
+-                        opl_chip_timeouts[c]++;
+-                }
+-            }
+-
+-            cursor[0] = BETWEEN(-32768, 32767, mix[0]);
+-            cursor[1] = BETWEEN(-32768, 32767, mix[1]);
+-            cursor += 2;
+-        }
+-
+-        //OPL3_GenerateStream(&opl_chip, (Bit16s *)(buffer + filled * 4), nsamples);
++        // Add native-rate OPL2 output to the camera-rate stream.
++        GenerateOutput((int16_t *)(buffer + filled * 4),
++                       (unsigned int)nsamples);
+         filled += nsamples;
+ 
+         // Invoke callbacks for this point in time.
+@@ -233,18 +210,21 @@ int OPL_FillBuffer(byte *buffer, int buffer_samples)
+ static void OPL_SDL_Shutdown(void)
+ {
+     OPL_Queue_Destroy(callback_queue);
+-
+-/*
++    callback_queue = NULL;
+     if (opl_chip != NULL)
+     {
+-        OPLDestroy(opl_chip);
++        OPL_delete(opl_chip);
+         opl_chip = NULL;
+     }
+-    */
+ }
+ 
+ static int OPL_SDL_Init(unsigned int port_base, int num_chips)
+ {
++    (void)port_base;
++    if (num_chips != 1)
++    {
++        return 0;
++    }
+     opl_sdl_paused = 0;
+     pause_offset = 0;
+ 
+@@ -253,22 +233,18 @@ static int OPL_SDL_Init(unsigned int port_base, int num_chips)
+     callback_queue = OPL_Queue_Create();
+     current_time = 0;
+ 
+-    // Get the mixer frequency, format and number of channels.
+-
+-    // Only supports AUDIO_S16SYS
+-    mixing_channels = 2;
+-
+     // Create the emulator structure:
+ 
+-    for (int c = 0; c < num_opl_chips; ++c)
+-        OPL3_Reset(&opl_chips[c], OPL_SAMPLE_RATE);
+-    opl_opl3mode = 0;
+-
+-    for (int c = 0; c < OPL_MAX_CHIPS; ++c)
++    opl_chip = OPL_new(E1_OPL_CLOCK_HZ, E1_OPL_ENGINE_RATE);
++    if (opl_chip == NULL)
+     {
+-        opl_chip_keys[c] = 0;
+-        opl_chip_timeouts[c] = OPL_CHIP_TIMEOUT;
++        OPL_Queue_Destroy(callback_queue);
++        callback_queue = NULL;
++        return 0;
+     }
++    opl_source_remainder = 0;
++    opl_previous_sample = 0;
++    opl_opl3mode = 0;
+ 
+     return 1;
+ }
+@@ -360,27 +336,15 @@ static void WriteRegister(int chip, unsigned int reg_num, unsigned int value)
+             break;
+ 
+         case OPL_REG_NEW:
+-            // Keep all chips synchronized with the first chip's opl3 mode
+-            if (chip == 0)
+-            {
+-                for (int c = 0; c < num_opl_chips; ++c)
+-                    OPL3_WriteRegBuffered(&opl_chips[c], reg_num, value);
+-                opl_opl3mode = value & 0x01;
+-            }
++            // This camera backend intentionally exposes an OPL2 chip.
++            opl_opl3mode = 0;
+             break;
+ 
+         default:
+-            // Keep track of which channels are keyed-on so we know when the chip is in use
+-            if ((reg_num & 0xff) >= 0xb0 && (reg_num & 0xff) <= 0xb8)
++            if (chip == 0 && (reg_num & 0x100) == 0 && opl_chip != NULL)
+             {
+-                uint32_t key_bit = 1 << (((reg_num & 0x100) ? 9 : 0) + (reg_num & 0xf));
+-                if (value & (1 << 5))
+-                    opl_chip_keys[chip] |= key_bit;
+-                else
+-                    opl_chip_keys[chip] &= ~key_bit;
++                OPL_writeReg(opl_chip, reg_num, (uint8_t)value);
+             }
+-
+-            OPL3_WriteRegBuffered(&opl_chips[chip], reg_num, value);
+             break;
+     }
+ }
+@@ -429,4 +393,3 @@ opl_driver_t opl_sdl_driver =
+     OPL_SDL_ClearCallbacks,
+     OPL_SDL_AdjustCallbacks,
+ };
+-
+diff --git a/src/d_main.c b/src/d_main.c
+index aef01a3..cfc9f79 100644
+--- a/src/d_main.c
++++ b/src/d_main.c
+@@ -1,6 +1,7 @@
+ //
+ //  Copyright (C) 1999 by
+ //  id Software, Chi Hoang, Lee Killough, Jim Flynn, Rand Phares, Ty Halderman
++//  Modified for E1 Doom, 2026.
+ //
+ //  This program is free software; you can redistribute it and/or
+ //  modify it under the terms of the GNU General Public License
+@@ -437,6 +438,10 @@ static int demosequence;         // killough 5/2/98: made static
+ static int pagetic;
+ static const char *pagename;
+ static demoloop_t demoloop_point;
++#ifdef E1_CAMERA
++#define E1_TITLE_DWELL_US UINT64_C(20000000)
++static uint64_t e1_title_visible_start_us;
++#endif
+ 
+ //
+ // D_PageTicker
+@@ -444,6 +449,42 @@ static demoloop_t demoloop_point;
+ //
+ void D_PageTicker(void)
+ {
++#ifdef E1_CAMERA
++  // Presentation is intentionally capped to the camera stream rate, which can
++  // make page tics advance below 35 Hz.  Keep the first TITLEPIC dwell close to
++  // real wall time and do not start it while Doom is hidden behind the camera
++  // or entering through the external OSG melt.
++  if (demosequence == 0 && demoloop_point != NULL &&
++      demoloop_point->type == TYPE_ART)
++    {
++      uint64_t now;
++
++      if (!I_E1DemoTimerActive())
++        {
++          e1_title_visible_start_us = 0;
++          return;
++        }
++      now = I_GetTimeUS();
++      if (e1_title_visible_start_us == 0)
++        {
++          e1_title_visible_start_us = now;
++          I_Printf(VB_INFO, "E1_TITLE visible-start");
++          return;
++        }
++      if (now - e1_title_visible_start_us < E1_TITLE_DWELL_US)
++        return;
++      if (!singledemo)
++        {
++          I_Printf(VB_INFO, "E1_TITLE demo-advance elapsed_ms=%llu",
++                   (unsigned long long)
++                     ((now - e1_title_visible_start_us) / UINT64_C(1000)));
++          e1_title_visible_start_us = 0;
++          D_AdvanceDemo();
++        }
++      return;
++    }
++#endif
++
+   // killough 12/98: don't advance internal demos if a single one is 
+   // being played. The only time this matters is when using -loadgame with
+   // -fastdemo, -playdemo, or -timedemo, and a consistency error occurs.
+diff --git a/src/i_input.h b/src/i_input.h
+index 0eaf6af..581f391 100644
+--- a/src/i_input.h
++++ b/src/i_input.h
+@@ -1,5 +1,6 @@
+ //
+ // Copyright(C) 2023 Roman Fomin
++// Modified for E1 Doom, 2026.
+ //
+ // This program is free software; you can redistribute it and/or
+ // modify it under the terms of the GNU General Public License
+@@ -53,4 +54,9 @@ void I_StartTextInput(void);
+ void I_StopTextInput(void);
+ void I_BindKeyboardVariables(void);
+ 
++#ifdef E1_CAMERA
++// The E1 attract loop starts only after the camera entry melt is complete.
++boolean I_E1DemoTimerActive(void);
++#endif
++
+ #endif
+diff --git a/src/i_oalsound.h b/src/i_oalsound.h
+index 7da5f3d..2f314e8 100644
+--- a/src/i_oalsound.h
++++ b/src/i_oalsound.h
+@@ -1,6 +1,7 @@
+ //
+ // Copyright(C) 2023 Roman Fomin
+ // Copyright(C) 2023 ceski
++// Modified for E1 Doom, 2026.
+ //
+ // This program is free software; you can redistribute it and/or
+ // modify it under the terms of the GNU General Public License
+@@ -19,7 +20,11 @@
+ #ifndef __I_OALSOUND__
+ #define __I_OALSOUND__
+ 
++#ifdef E1_CAMERA
++typedef float ALfloat;
++#else
+ #include "al.h"
++#endif
+ 
+ #include "doomtype.h"
+ 
+diff --git a/src/i_oplmusic.c b/src/i_oplmusic.c
+index 08ca74c..02af6a1 100644
+--- a/src/i_oplmusic.c
++++ b/src/i_oplmusic.c
+@@ -1,6 +1,7 @@
+ //
+ // Copyright(C) 1993-1996 Id Software, Inc.
+ // Copyright(C) 2005-2014 Simon Howard
++// Modified for E1 Doom, 2026.
+ //
+ // This program is free software; you can redistribute it and/or
+ // modify it under the terms of the GNU General Public License
+@@ -360,7 +361,14 @@ static unsigned int last_perc_count;
+ // Configuration file variable, containing the port number for the
+ // adlib chip.
+ 
++#ifdef E1_CAMERA
++// Original Doom targeted nine-voice OPL2.  On the two-core Cortex-A7 this also
++// selects the bit-exact upper-bank skip in Nuked OPL, leaving more CPU for the
++// renderer and the stock AAC/H.264 paths.
++static char *snd_dmxoption = "";
++#else
+ static char *snd_dmxoption = "-opl3"; // [crispy] default to OPL3 emulation
++#endif
+ static int opl_io_port = 0x388;
+ int num_opl_chips = 1;
+ 
+diff --git a/src/mn_menu.c b/src/mn_menu.c
+index 3ab9c03..506c0be 100644
+--- a/src/mn_menu.c
++++ b/src/mn_menu.c
+@@ -2,6 +2,7 @@
+ //  Copyright (C) 1999 by
+ //  id Software, Chi Hoang, Lee Killough, Jim Flynn, Rand Phares, Ty Halderman
+ //  Copyright(C) 2020-2021 Fabian Greffrath
++//  Modified for E1 Doom, 2026.
+ //
+ //  This program is free software; you can redistribute it and/or
+ //  modify it under the terms of the GNU General Public License
+@@ -49,6 +50,9 @@
+ #include "m_swap.h"
+ #include "mn_font.h"
+ #include "mn_menu.h"
++#ifdef E1_CAMERA
++#include "e1-dashboard.h"
++#endif
+ #include "mn_internal.h"
+ #include "mn_snapshot.h"
+ #include "p_saveg.h"
+@@ -1489,6 +1493,12 @@ static void M_QuitResponse(int ch)
+     {
+         return;
+     }
++#ifdef E1_CAMERA
++    /* The camera runtime owns the exit presentation.  It starts the melt,
++     * silences the active mix, and plays one deterministic player-death sting
++     * while the camera bleeds back in. */
++    I_E1ReturnToCamera();
++#else
+     if (D_AllowQuitSound() &&
+         (!netgame || demoplayback) && // killough 12/98
+         !nosfxparm)                   // avoid delay if no sound card
+@@ -1504,6 +1514,7 @@ static void M_QuitResponse(int ch)
+         I_WaitVBL(105);
+     }
+     I_SafeExit(0); // killough
++#endif
+ }
+ 
+ static void M_QuitDOOM(int choice)
+diff --git a/src/mn_setup.c b/src/mn_setup.c
+index cc864df..ad95cd1 100644
+--- a/src/mn_setup.c
++++ b/src/mn_setup.c
+@@ -1,6 +1,7 @@
+ //
+ //  Copyright (C) 1999 by
+ //  id Software, Chi Hoang, Lee Killough, Jim Flynn, Rand Phares, Ty Halderman
++//  Modified for E1 Doom, 2026.
+ //
+ //  This program is free software; you can redistribute it and/or
+ //  modify it under the terms of the GNU General Public License
+@@ -169,7 +170,9 @@ static void DisableItem(boolean condition, setup_menu_t *menu, const char *item)
+         menu++;
+     }
+ 
++#ifndef E1_CAMERA
+     I_Error("Item \"%s\" not found in menu", item);
++#endif
+ }
+ 
+ /////////////////////////////
+@@ -3625,8 +3628,16 @@ void MN_InitDefaults(void)
+                     default_t *dp = M_LookupDefault(current_item->var.name);
+                     if (!dp)
+                     {
++#ifdef E1_CAMERA
++                        // The camera target deliberately omits desktop-only
++                        // SDL/OpenAL/controller settings. Their setup rows are
++                        // never entered by the five-button proof of concept.
++                        current_item->m_flags = S_SKIP;
++                        continue;
++#else
+                         I_Error("Could not find config variable \"%s\"",
+                                 current_item->var.name);
++#endif
+                     }
+                     else
+                     {
+@@ -4935,6 +4946,9 @@ void MN_InitMenuStrings(void)
+ 
+ void MN_SetupResetMenu(void)
+ {
++#ifdef E1_CAMERA
++    return;
++#endif
+     DisableItem(force_strictmode, comp_settings1, "strictmode");
+     DisableItem(force_complevel != CL_NONE, comp_settings1, "default_complevel");
+     DisableItem(M_ParmExists("-pistolstart"), comp_settings1, "pistolstart");
+diff --git a/src/r_draw.c b/src/r_draw.c
+index 7ab8319..c8734e8 100644
+--- a/src/r_draw.c
++++ b/src/r_draw.c
+@@ -1,6 +1,7 @@
+ //
+ //  Copyright (C) 1999 by
+ //  id Software, Chi Hoang, Lee Killough, Jim Flynn, Rand Phares, Ty Halderman
++//  Modified for E1 Doom, 2026.
+ //
+ //  This program is free software; you can redistribute it and/or
+ //  modify it under the terms of the GNU General Public License
+@@ -769,70 +770,73 @@ fixed_t ds_ystep;
+ // start of a 64*64 tile image
+ byte *ds_source;
+ 
+-#define R_DRAW_SPAN(NAME, SRCPIXEL)                    \
+-    static void DrawSpan##NAME(void)                   \
+-    {                                                  \
+-        byte *dest = ylookup[ds_y] + columnofs[ds_x1]; \
+-                                                       \
+-        unsigned count = ds_x2 - ds_x1 + 1;            \
+-                                                       \
+-        unsigned xtemp, ytemp, spot;                   \
+-                                                       \
+-        while (count >= 4)                             \
++#if defined(E1_CAMERA) && defined(__arm__)
++#define E1_SPAN_STORE(DEST, VALUE) \
++    __asm__ volatile ("strb %1, [%0], #1" : "+r" (DEST) : "r" (VALUE) : "memory")
++#else
++#define E1_SPAN_STORE(DEST, VALUE) (*(DEST)++ = (VALUE))
++#endif
++
++#define R_DRAW_SPAN(NAME, SRCPIXEL)                                    \
++    static void DrawSpan##NAME(void)                                   \
++    {                                                                  \
++        byte *restrict dest = ylookup[ds_y] + columnofs[ds_x1];         \
++        const byte *restrict source = ds_source;                        \
++        const byte *restrict brightmap = ds_brightmap;                  \
++        lighttable_t *restrict colormap0 = ds_colormap[0];              \
++        lighttable_t *restrict colormap1 = ds_colormap[1];              \
++        fixed_t xfrac = ds_xfrac;                                      \
++        fixed_t yfrac = ds_yfrac;                                      \
++        const fixed_t xstep = ds_xstep;                                \
++        const fixed_t ystep = ds_ystep;                                \
++        (void)brightmap;                                                \
++        (void)colormap1;                                                \
++                                                                         \
++        unsigned count = ds_x2 - ds_x1 + 1;                            \
++                                                                         \
++        unsigned xtemp, ytemp, spot;                                   \
++                                                                         \
++        while (count >= 2)                             \
+         {                                              \
+             byte src;                                  \
+-            ytemp = (ds_yfrac >> 10) & 0x0FC0;         \
+-            xtemp = (ds_xfrac >> 16) & 0x003F;         \
+-            spot = xtemp | ytemp;                      \
+-            ds_xfrac += ds_xstep;                      \
+-            ds_yfrac += ds_ystep;                      \
+-            src = ds_source[spot];                     \
+-            dest[0] = SRCPIXEL;                        \
+-                                                       \
+-            ytemp = (ds_yfrac >> 10) & 0x0FC0;         \
+-            xtemp = (ds_xfrac >> 16) & 0x003F;         \
++            ytemp = (yfrac >> 10) & 0x0FC0;            \
++            xtemp = (xfrac >> 16) & 0x003F;            \
+             spot = xtemp | ytemp;                      \
+-            ds_xfrac += ds_xstep;                      \
+-            ds_yfrac += ds_ystep;                      \
+-            src = ds_source[spot];                     \
+-            dest[1] = SRCPIXEL;                        \
++            xfrac += xstep;                            \
++            yfrac += ystep;                            \
++            src = source[spot];                        \
++            E1_SPAN_STORE(dest, SRCPIXEL);              \
+                                                        \
+-            ytemp = (ds_yfrac >> 10) & 0x0FC0;         \
+-            xtemp = (ds_xfrac >> 16) & 0x003F;         \
++            ytemp = (yfrac >> 10) & 0x0FC0;            \
++            xtemp = (xfrac >> 16) & 0x003F;            \
+             spot = xtemp | ytemp;                      \
+-            ds_xfrac += ds_xstep;                      \
+-            ds_yfrac += ds_ystep;                      \
+-            src = ds_source[spot];                     \
+-            dest[2] = SRCPIXEL;                        \
++            xfrac += xstep;                            \
++            yfrac += ystep;                            \
++            src = source[spot];                        \
++            E1_SPAN_STORE(dest, SRCPIXEL);              \
+                                                        \
+-            ytemp = (ds_yfrac >> 10) & 0x0FC0;         \
+-            xtemp = (ds_xfrac >> 16) & 0x003F;         \
+-            spot = xtemp | ytemp;                      \
+-            ds_xfrac += ds_xstep;                      \
+-            ds_yfrac += ds_ystep;                      \
+-            src = ds_source[spot];                     \
+-            dest[3] = SRCPIXEL;                        \
+-                                                       \
+-            dest += 4;                                 \
+-            count -= 4;                                \
++            count -= 2;                                \
+         }                                              \
+                                                        \
+         while (count)                                  \
+         {                                              \
+             byte src;                                  \
+-            ytemp = (ds_yfrac >> 10) & 0x0FC0;         \
+-            xtemp = (ds_xfrac >> 16) & 0x003F;         \
++            ytemp = (yfrac >> 10) & 0x0FC0;            \
++            xtemp = (xfrac >> 16) & 0x003F;            \
+             spot = xtemp | ytemp;                      \
+-            ds_xfrac += ds_xstep;                      \
+-            ds_yfrac += ds_ystep;                      \
+-            src = ds_source[spot];                     \
++            xfrac += xstep;                            \
++            yfrac += ystep;                            \
++            src = source[spot];                        \
+             *dest++ = SRCPIXEL;                        \
+             count--;                                   \
+-        }                                              \
++        }                                                              \
++                                                                       \
++        ds_xfrac = xfrac;                                              \
++        ds_yfrac = yfrac;                                              \
+     }
+ 
+-R_DRAW_SPAN(, ds_colormap[0][src])
+-R_DRAW_SPAN(Brightmap, ds_colormap[ds_brightmap[src]][src])
++R_DRAW_SPAN(, colormap0[src])
++R_DRAW_SPAN(Brightmap, (brightmap[src] ? colormap1 : colormap0)[src])
+ 
+ void (*R_DrawColumn)(void) = DrawColumn;
+ void (*R_DrawTLColumn)(void) = DrawColumnTL;

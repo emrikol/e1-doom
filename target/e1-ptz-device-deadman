@@ -1,0 +1,139 @@
+#!/bin/sh
+# Detached owner for the first real-device, camera-pass-through PTZ hook gate.
+# It restores instruction bytes before permitting the injected library unload.
+set -u
+
+ttl=${1:-20}
+runtime=/mnt/tmp/e1-doom
+state="$runtime/state"
+
+immediate=0
+finalize=1
+if test "$ttl" = now; then
+    immediate=1
+elif test "$ttl" = restore-only; then
+    immediate=1
+    finalize=0
+else
+    case "$ttl" in
+        ''|*[!0-9]*) exit 2 ;;
+    esac
+    test "$ttl" -ge 15 || exit 2
+    test "$ttl" -le 60 || exit 2
+fi
+
+log()
+{
+    now=$(/bin/date +%s 2>/dev/null || echo 0)
+    echo "$now $*" >>"$state/ptz-watchdog.log"
+}
+
+owned_pid()
+{
+    role=$1
+    expected=$2
+    pid_file="$state/$role.pid"
+    test -s "$pid_file" || return 1
+    pid=$(/bin/busybox head -n 1 "$pid_file")
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    test -r "/proc/$pid/cmdline" || return 1
+    command_line=$(/bin/busybox tr '\000' ' ' <"/proc/$pid/cmdline")
+    case "$command_line" in
+        *"$expected"*) echo "$pid"; return 0 ;;
+    esac
+    log "refuse-$role pid=$pid command=$command_line"
+    return 1
+}
+
+wait_for_file()
+{
+    file=$1
+    attempts=$2
+    count=0
+    while test "$count" -lt "$attempts" && ! test -f "$file"; do
+        /bin/sleep 1
+        count=$((count + 1))
+    done
+    test -f "$file"
+}
+
+echo ready >"$state/ptz-deadman.ready"
+test "$immediate" -eq 1 || /bin/sleep "$ttl"
+echo fired >"$state/ptz-deadman.fired"
+log deadman-fired
+
+if test -f "$state/ptz.patch.used"; then
+    owner_expected=e1-ptz-hook-owner-dummy
+    if test -f "$state/ptz-owner.kind" &&
+       grep -qx doom "$state/ptz-owner.kind"; then
+        owner_expected=e1-doom
+    fi
+    if owner=$(owned_pid ptz-owner "$owner_expected"); then
+        /bin/kill -KILL "$owner" 2>/dev/null || true
+        log "owner-killed pid=$owner expected=$owner_expected"
+    else
+        log owner-already-gone
+    fi
+
+    if ! wait_for_file "$state/ptz.restored" 6; then
+        if supervisor=$(owned_pid ptz-supervisor e1-ptz-patch-supervisor); then
+            /bin/kill -USR1 "$supervisor" 2>/dev/null || true
+            log "ptz-supervisor-signalled pid=$supervisor"
+        fi
+        wait_for_file "$state/ptz.restored" 4 || true
+    fi
+
+    if ! test -f "$state/ptz.restored"; then
+        device_pid=$(/bin/pidof device 2>/dev/null || true)
+        hook_address=$(/bin/busybox head -n 1 "$state/ptz.hook.address" 2>/dev/null || true)
+        if test -n "$device_pid" && test -n "$hook_address"; then
+            log emergency-device-restore-start
+            "$runtime/e1-ptz-patch-supervisor" \
+                --restore-device "$device_pid" "$hook_address" \
+                >>"$state/ptz-watchdog.log" 2>&1 || true
+        fi
+    fi
+
+    if ! test -f "$state/ptz.restored" ||
+       test -f "$state/ptz.patch.active"; then
+        echo device-patch-not-restored >"$state/ptz.recovery.failed"
+        log recovery-failed-device-patch
+        exit 1
+    fi
+fi
+
+if game=$(owned_pid game e1-doom); then
+    /bin/kill -KILL "$game" 2>/dev/null || true
+    log "game-killed pid=$game"
+fi
+
+if test "$finalize" -eq 0; then
+    echo complete >"$state/ptz-recovery.patch-complete"
+    log patch-recovery-complete
+    exit 0
+fi
+
+if supervisor=$(owned_pid supervisor e1-injected-supervisor); then
+    /bin/kill -USR1 "$supervisor" 2>/dev/null || true
+    log "injected-supervisor-signalled pid=$supervisor"
+fi
+
+if ! wait_for_file "$state/restored" 12; then
+    echo injected-library-not-restored >"$state/ptz.recovery.failed"
+    log recovery-failed-library
+    exit 1
+fi
+
+device_pid=$(/bin/pidof device 2>/dev/null || true)
+if test -z "$device_pid" ||
+   grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps"; then
+    echo injected-library-still-mapped >"$state/ptz.recovery.failed"
+    log recovery-failed-mapping
+    exit 1
+fi
+
+echo complete >"$state/ptz-recovery.complete"
+log recovery-complete
+exit 0

@@ -1,0 +1,148 @@
+diff --git a/opl/emu8950.c b/opl/emu8950.c
+index de7fcc1..ae3e347 100644
+--- a/opl/emu8950.c
++++ b/opl/emu8950.c
+@@ -1747,8 +1747,10 @@ void OPL_calc_buffer_linear(OPL *opl, int32_t *buffer, uint32_t nsamples) {
+     for(uint32_t s = 0; s<nsamples; s++) {
+         // generate amplitude modulation same for all channels
+         // need am_phase and lfo_am
+-        opl->am_phase_index++;
+-        if (opl->am_phase_index == sizeof(am_table)) opl->am_phase_index = 0;
++        opl->am_phase_index += EMU8950_SAMPLE_STRIDE;
++        if (opl->am_phase_index >= sizeof(am_table)) {
++            opl->am_phase_index -= sizeof(am_table);
++        }
+         // todo this is a candidate for remove simply because it is not super noticeable without
+ 
+ #if EMU8950_SLOT_RENDER
+@@ -1845,8 +1847,10 @@ void OPL_calc_buffer_linear(OPL *opl, int32_t *buffer, uint32_t nsamples) {
+ #endif
+         }
+     }
+-    opl->pm_phase = (opl->pm_phase + opl->pm_dphase * nsamples) & (PM_DP_WIDTH - 1);
+-    opl->eg_counter += nsamples;
++    opl->pm_phase =
++        (opl->pm_phase + opl->pm_dphase * nsamples * EMU8950_SAMPLE_STRIDE) &
++        (PM_DP_WIDTH - 1);
++    opl->eg_counter += nsamples * EMU8950_SAMPLE_STRIDE;
+ 
+ }
+ #endif
+@@ -2025,4 +2029,4 @@ void OPL_writeReg(OPL *opl, uint32_t reg, uint8_t data) {
+         }
+     }
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/opl/slot_render.cpp b/opl/slot_render.cpp
+index b80dc9b..35730ee 100644
+--- a/opl/slot_render.cpp
++++ b/opl/slot_render.cpp
+@@ -303,7 +303,8 @@ template<bool PM> uint32_t advance_phase(SLOT_RENDER *slot, uint32_t &pm_phase)
+ #if !PICO_ON_DEVICE
+         // todo if we do this with interpolator, then we can just skip the if
+         // todo PM_DPHASE == 512
+-        pm_phase = (pm_phase + PM_DPHASE) & (PM_DP_WIDTH - 1);
++        pm_phase = (pm_phase + PM_DPHASE * EMU8950_SAMPLE_STRIDE) &
++                   (PM_DP_WIDTH - 1);
+         pm = slot->efix_pm_table[pm_phase >> (PM_DP_BITS - PM_PG_BITS)];
+ #else
+         interp1->add_raw[1] = 1;
+@@ -312,7 +313,9 @@ template<bool PM> uint32_t advance_phase(SLOT_RENDER *slot, uint32_t &pm_phase)
+ #endif
+     }
+ #if !PICO_ON_DEVICE
+-    slot->pg_phase += slot->efix_pg_pm_x_fnum3ff + pm * slot->efix_pg_phase_multiplier;
++    slot->pg_phase +=
++        (slot->efix_pg_pm_x_fnum3ff +
++         pm * slot->efix_pg_phase_multiplier) * EMU8950_SAMPLE_STRIDE;
+ #if EMU8950_NIT_PICKS
+     slot->pg_phase &= (DP_WIDTH - 1) * 2; // note the clear bottom bit is just for exact compatability for comparison with original code
+ #else
+@@ -502,7 +505,7 @@ template <int F_NUM, typename F> uint32_t slot_envelope_loop(F&& fn, SLOT_RENDER
+         //    }
+         if (slot->eg_out == 0) {
+             // straight into decay
+-            eg_counter++;
++            eg_counter += EMU8950_SAMPLE_STRIDE;
+             slot->eg_state = DECAY;
+             commit_slot_update_eg_only<DECAY>(slot);
+             fn(slot, pm_phase, s++);
+@@ -511,7 +514,8 @@ template <int F_NUM, typename F> uint32_t slot_envelope_loop(F&& fn, SLOT_RENDER
+ #if DUMPO
+                 if (hack_ch == 17 && s == 12) breako();
+ #endif
+-                if (unlikely((++eg_counter & eg_shift_mask) == 0)) {
++                eg_counter += EMU8950_SAMPLE_STRIDE;
++                if (unlikely((eg_counter & eg_shift_mask) == 0)) {
+                     uint8_t step = eg_step_table[(eg_counter >> slot->eg_shift) & 7];
+                     slot->eg_out += (~slot->eg_out * step) >> 3;
+                     slot->eg_out_tll_lsl3 = std::min(EG_MAX/*EG_MUTE*/, slot->eg_out + slot->tll) << 3; // note EG_MAX not EG_MUTE to avoid overflow check later
+@@ -533,19 +537,20 @@ template <int F_NUM, typename F> uint32_t slot_envelope_loop(F&& fn, SLOT_RENDER
+         // the original code checked for sustain every loop, however we have move it inside the once per 1<<eg_shift_mask check
+         // so we must check it here outside the sample loop unless the first iteration of the sample loop would check it because of the
+         // value of eg_counter
+-        if (!(((eg_counter+1) & eg_shift_mask) == 0) &&
++        if (!(((eg_counter + EMU8950_SAMPLE_STRIDE) & eg_shift_mask) == 0) &&
+             ((slot->patch->SL != 15) && (slot->eg_out >> 4) == slot->patch->SL)) {
+             if (s < nsamples) {
+                 // because we have moved the second line of the test above into the per !(++eg_coiunter & eg_shift_maask))
+                 // test below, we have to half unroll the first loop
+                 slot->eg_state = SUSTAIN;
+-                eg_counter++;
++                eg_counter += EMU8950_SAMPLE_STRIDE;
+                 commit_slot_update_eg_only<SUSTAIN>(slot);
+                 fn(slot, pm_phase, s++);
+             }
+         } else {
+             for (; s < nsamples; s++) {
+-                if (unlikely((++eg_counter & eg_shift_mask) == 0)) {
++                eg_counter += EMU8950_SAMPLE_STRIDE;
++                if (unlikely((eg_counter & eg_shift_mask) == 0)) {
+                     slot->eg_out = static_cast<int16_t>(std::min(EG_MUTE, slot->eg_out + (int) eg_step_table[
+                             (eg_counter >> slot->eg_shift) & 7]));
+                     slot->eg_out_tll_lsl3 = std::min(EG_MAX/*EG_MUTE*/, slot->eg_out + slot->tll) << 3; // note EG_MAX not EG_MUTE to avoid overflow check later
+@@ -571,7 +576,8 @@ template <int F_NUM, typename F> uint32_t slot_envelope_loop(F&& fn, SLOT_RENDER
+         uint32_t eg_shift_mask = slot->eg_rate_h > 0 ? (1 << slot->eg_shift) - 1 : 0xffffffff;
+         uint8_t *eg_step_table = get_decay_step_table(slot);
+         for (; s < nsamples; s++) {
+-            if (unlikely((++eg_counter & eg_shift_mask) == 0)) {
++            eg_counter += EMU8950_SAMPLE_STRIDE;
++            if (unlikely((eg_counter & eg_shift_mask) == 0)) {
+                 slot->eg_out = static_cast<int16_t>(std::min(EG_MUTE, slot->eg_out + (int)eg_step_table[(eg_counter >> slot->eg_shift)&7]));
+ #if EMU8950_LINEAR_END_OF_NOTE_OPTIMIZATION
+                 if (slot->eg_out == EG_MUTE) {
+@@ -652,4 +658,4 @@ extern "C" uint32_t slot_car_linear_alg1(OPL *opl, SLOT_RENDER *slot, uint32_t n
+     else
+         return slot_car_linear_alg1<false>(opl, slot, nsamples, eg_counter, pm_phase);
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/opl/slot_render.h b/opl/slot_render.h
+index 714964a..d1cb9f8 100644
+--- a/opl/slot_render.h
++++ b/opl/slot_render.h
+@@ -8,6 +8,14 @@
+ extern "C" {
+ #endif
+ #include <stdint.h>
++
++#ifndef EMU8950_SAMPLE_STRIDE
++#define EMU8950_SAMPLE_STRIDE 1
++#endif
++#if EMU8950_SAMPLE_STRIDE < 1 || EMU8950_SAMPLE_STRIDE > 8
++#error "EMU8950_SAMPLE_STRIDE must be between 1 and 8"
++#endif
++
+ #define EG_BITS 9
+ #define EG_MUTE ((1 << EG_BITS) - 1)
+ #define EG_MAX (0x1f0) // 93dB
+@@ -138,4 +146,4 @@ struct SLOT_RENDER {
+ #ifdef __cplusplus
+ }
+ #endif
+-#endif
+\ No newline at end of file
++#endif

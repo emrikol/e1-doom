@@ -1,0 +1,178 @@
+#!/bin/sh
+# Detached owner for the final-PCM hook. Restore the exact stock instruction
+# bytes before permitting the injected library to unload.
+set -u
+
+ttl=${1:-20}
+runtime=/mnt/tmp/e1-doom
+state="$runtime/state"
+
+immediate=0
+finalize=1
+if test "$ttl" = now; then
+    immediate=1
+elif test "$ttl" = restore-only; then
+    immediate=1
+    finalize=0
+else
+    case "$ttl" in
+        ''|*[!0-9]*) exit 2 ;;
+    esac
+    test "$ttl" -ge 15 || exit 2
+    test "$ttl" -le 60 || exit 2
+fi
+
+log()
+{
+    now=$(/bin/date +%s 2>/dev/null || echo 0)
+    echo "$now $*" >>"$state/audio-watchdog.log"
+}
+
+owned_pid()
+{
+    role=$1
+    expected=$2
+    pid_file="$state/$role.pid"
+    test -s "$pid_file" || return 1
+    pid=$(/bin/busybox head -n 1 "$pid_file")
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    test -r "/proc/$pid/cmdline" || return 1
+    command_line=$(/bin/busybox tr '\000' ' ' <"/proc/$pid/cmdline")
+    case "$command_line" in
+        *"$expected"*) echo "$pid"; return 0 ;;
+    esac
+    log "refuse-$role pid=$pid command=$command_line"
+    return 1
+}
+
+wait_for_file()
+{
+    file=$1
+    attempts=$2
+    count=0
+    while test "$count" -lt "$attempts" && ! test -f "$file"; do
+        /bin/sleep 1
+        count=$((count + 1))
+    done
+    test -f "$file"
+}
+
+echo ready >"$state/audio-deadman.ready"
+test "$immediate" -eq 1 || /bin/sleep "$ttl"
+echo fired >"$state/audio-deadman.fired"
+log deadman-fired
+
+if test -f "$state/audio.patch.used"; then
+    if test -f "$state/audio.active"; then
+        command_tmp="$state/injected.command.audio-deadman.$$"
+        echo audio-stop >"$command_tmp"
+        mv "$command_tmp" "$state/injected.command"
+        wait_for_file "$state/audio.source.restored" 5 || true
+        count=0
+        while test "$count" -lt 5 && test -f "$state/audio.active"; do
+            /bin/sleep 1
+            count=$((count + 1))
+        done
+    fi
+
+    if owner=$(owned_pid audio-owner e1-ptz-hook-owner-dummy); then
+        /bin/kill -KILL "$owner" 2>/dev/null || true
+        log "audio-owner-killed pid=$owner"
+    else
+        log audio-owner-already-gone
+    fi
+
+    if supervisor=$(owned_pid audio-supervisor e1-ptz-patch-supervisor); then
+        /bin/kill -USR1 "$supervisor" 2>/dev/null || true
+        log "audio-supervisor-signalled pid=$supervisor"
+    fi
+    count=0
+    while test "$count" -lt 8 &&
+          { ! test -f "$state/audio.restored" ||
+            ! test -f "$state/audio.hook.quiesced" ||
+            test -f "$state/audio.patch.active"; }; do
+        /bin/sleep 1
+        count=$((count + 1))
+    done
+
+    if ! test -f "$state/audio.restored"; then
+        device_pid=$(/bin/pidof device 2>/dev/null || true)
+        hook_address=$(/bin/busybox head -n 1 "$state/audio.hook.address" 2>/dev/null || true)
+        if test -n "$device_pid" && test -n "$hook_address"; then
+            log emergency-device-audio-restore-start
+            "$runtime/e1-ptz-patch-supervisor" \
+                --restore-device-audio "$device_pid" "$hook_address" \
+                >>"$state/audio-watchdog.log" 2>&1 || true
+        fi
+    fi
+
+    if ! test -f "$state/audio.restored" ||
+       ! test -f "$state/audio.hook.quiesced" ||
+       test -f "$state/audio.patch.active"; then
+        echo device-audio-patch-not-restored >"$state/audio.recovery.failed"
+        log recovery-failed-device-audio-patch
+        exit 1
+    fi
+fi
+
+if test "$finalize" -eq 0; then
+    echo complete >"$state/audio-recovery.patch-complete"
+    log patch-recovery-complete
+    exit 0
+fi
+
+if supervisor=$(owned_pid supervisor e1-injected-supervisor); then
+    /bin/kill -USR1 "$supervisor" 2>/dev/null || true
+    log "injected-supervisor-signalled pid=$supervisor"
+fi
+
+if ! wait_for_file "$state/restored" 12; then
+    attempt=0
+    while test "$attempt" -lt 8 && ! test -f "$state/restored"; do
+        device_pid=$(/bin/pidof device 2>/dev/null || true)
+        if test -n "$device_pid" &&
+           grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps" &&
+           test -s "$state/injected.handle" &&
+           test -f "$state/thread.exited" &&
+           test -f "$state/media.restored" &&
+           test -f "$state/audio.restored" &&
+           test -f "$state/audio.hook.quiesced" &&
+           ! test -f "$state/media.active" &&
+           ! test -f "$state/audio.active" &&
+           ! test -f "$state/audio.patch.active"; then
+            hook_address=$(/bin/busybox head -n 1 "$state/audio.hook.address")
+            handle=$(/bin/busybox head -n 1 "$state/injected.handle")
+            if "$runtime/e1-ptz-patch-supervisor" \
+                   --inspect-device-audio "$device_pid" &&
+               "$runtime/e1-doom-injector" --unload "$device_pid" "$handle" \
+                   >>"$state/audio-watchdog.log" 2>&1 &&
+               ! grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps"; then
+                echo direct-unload-after-exact-restore >"$state/recovery.fallback"
+                echo injected-cleanup-complete >"$state/restored"
+                rm -f "$state/recovery.failed" "$state/audio.recovery.failed"
+                log recovery-fallback-direct-unload-complete
+            fi
+        fi
+        attempt=$((attempt + 1))
+        test -f "$state/restored" || /bin/sleep 1
+    done
+    if ! test -f "$state/restored"; then
+        echo injected-library-not-restored >"$state/audio.recovery.failed"
+        log recovery-failed-library
+        exit 1
+    fi
+fi
+
+device_pid=$(/bin/pidof device 2>/dev/null || true)
+if test -z "$device_pid" ||
+   grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps"; then
+    echo injected-library-still-mapped >"$state/audio.recovery.failed"
+    log recovery-failed-mapping
+    exit 1
+fi
+
+echo complete >"$state/audio-recovery.complete"
+log recovery-complete
+exit 0

@@ -1,0 +1,129 @@
+#!/bin/sh
+set -eu
+
+tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH='' cd -- "$tool_dir/.." && pwd)
+# shellcheck disable=SC1091
+. "$project_dir/sources.lock"
+
+iwad=${IWAD:-}
+test -s "$iwad" || {
+    echo "Set IWAD to a legally obtained Doom IWAD." >&2
+    exit 2
+}
+
+output_dir=${BUILD_DIR:-"$project_dir/build"}
+case "$output_dir" in
+    /*) ;;
+    *) output_dir="$project_dir/$output_dir" ;;
+esac
+output_root="$output_dir/e1-doom-root"
+output_launcher="$output_dir/e1-doom-run"
+output_boot_service="$output_dir/e1-doom-boot"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/e1-doom-rootfs.XXXXXX")
+
+cleanup()
+{
+    test -z "${stage:-}" || rm -rf "$stage"
+}
+trap cleanup EXIT HUP INT TERM
+
+for file in e1-doom e1-doom-controller e1-doom-probe e1-doom-injector \
+    e1-doom-injected.so e1-ptz-patch-supervisor e1-ptz-hook-owner-dummy \
+    woof.pk3; do
+    test -s "$output_dir/$file" || {
+        echo "missing build input: $output_dir/$file" >&2
+        exit 1
+    }
+done
+
+for file in \
+    target/e1-injected-supervisor \
+    target/e1-audio-device-deadman \
+    target/e1-ptz-device-deadman \
+    target/e1-injected-finalize \
+    target/e1-runtime-watchdog \
+    target/e1-doom-runtime \
+    target/e1-osg-snapshot \
+    target/e1-doom-run \
+    target/e1-doom-boot \
+    rootfs/e1-doom.toml \
+    LICENSE \
+    THIRD_PARTY.md \
+    LICENSES/MIT.txt \
+    LICENSES/BSD-3-Clause.txt \
+    .deps/woof/COPYING \
+    .deps/woof/README.md; do
+    test -s "$project_dir/$file" || {
+        echo "missing build input: $file" >&2
+        exit 1
+    }
+done
+
+install -d "$stage/bin" "$stage/share/doom" "$stage/etc" "$stage/licenses"
+for binary in e1-doom e1-doom-controller e1-doom-probe e1-doom-injector \
+    e1-ptz-patch-supervisor e1-ptz-hook-owner-dummy; do
+    install -m 0755 "$output_dir/$binary" "$stage/bin/$binary"
+done
+install -m 0644 "$output_dir/e1-doom-injected.so" \
+    "$stage/bin/e1-doom-injected.so"
+install -m 0644 "$output_dir/woof.pk3" "$stage/bin/woof.pk3"
+for script in e1-injected-supervisor e1-audio-device-deadman \
+    e1-ptz-device-deadman e1-injected-finalize e1-runtime-watchdog \
+    e1-doom-runtime e1-osg-snapshot; do
+    install -m 0755 "$project_dir/target/$script" "$stage/bin/$script"
+done
+install -m 0644 "$iwad" "$stage/share/doom/doom1.wad"
+install -m 0644 "$project_dir/rootfs/e1-doom.toml" "$stage/etc/e1-doom.toml"
+install -m 0644 "$project_dir/LICENSE" "$stage/licenses/E1-Doom-GPL-3.0.txt"
+install -m 0644 "$project_dir/.deps/woof/COPYING" \
+    "$stage/licenses/Woof-COPYING.txt"
+install -m 0644 "$project_dir/.deps/woof/README.md" \
+    "$stage/licenses/Woof-README.md"
+install -m 0644 "$project_dir/LICENSES/MIT.txt" "$stage/licenses/MIT.txt"
+install -m 0644 "$project_dir/LICENSES/BSD-3-Clause.txt" \
+    "$stage/licenses/BSD-3-Clause.txt"
+install -m 0644 "$project_dir/THIRD_PARTY.md" "$stage/licenses/THIRD_PARTY.md"
+if test -n "${IWAD_NOTICE:-}"; then
+    test -s "$IWAD_NOTICE"
+    install -m 0644 "$IWAD_NOTICE" "$stage/licenses/IWAD-NOTICE.txt"
+fi
+
+sha256_file()
+{
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+doom_hash=$(sha256_file "$stage/bin/e1-doom")
+controller_hash=$(sha256_file "$stage/bin/e1-doom-controller")
+injected_hash=$(sha256_file "$stage/bin/e1-doom-injected.so")
+iwad_hash=$(sha256_file "$stage/share/doom/doom1.wad")
+woof_data_hash=$(sha256_file "$stage/bin/woof.pk3")
+
+sed \
+    -e "s/@WOOF_COMMIT@/$WOOF_COMMIT/g" \
+    -e "s/@RP2040_DOOM_COMMIT@/$RP2040_DOOM_COMMIT/g" \
+    -e "s/@DOOM_HASH@/$doom_hash/g" \
+    -e "s/@CONTROLLER_HASH@/$controller_hash/g" \
+    -e "s/@INJECTED_HASH@/$injected_hash/g" \
+    -e "s/@IWAD_HASH@/$iwad_hash/g" \
+    -e "s/@WOOF_DATA_HASH@/$woof_data_hash/g" \
+    "$project_dir/rootfs/manifest.json.in" >"$stage/manifest.json"
+
+mkdir -p "$output_dir"
+rm -rf "$output_root"
+mv "$stage" "$output_root"
+stage=
+install -m 0755 "$project_dir/target/e1-doom-run" "$output_launcher"
+install -m 0755 "$project_dir/target/e1-doom-boot" "$output_boot_service"
+
+echo "root=$output_root"
+echo "launcher=$output_launcher"
+echo "boot_service=$output_boot_service"
+sha256_file "$output_root/manifest.json"
+sha256_file "$output_launcher"
+sha256_file "$output_boot_service"

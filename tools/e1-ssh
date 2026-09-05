@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH='' cd -- "$tool_dir/.." && pwd)
+state_dir=${E1_DOOM_HOST_STATE:-"$project_dir/.state"}
+port=${E1_DOOM_SSH_PORT:-22222}
+resolver="$tool_dir/e1-resolve"
+known_hosts=${E1_DOOM_KNOWN_HOSTS:-"$state_dir/e1_camera_known_hosts"}
+
+/bin/mkdir -p "$state_dir"
+host=$("$resolver")
+
+exec /usr/bin/ssh -T \
+    -p "$port" \
+    -o HostKeyAlias=e1-doom-camera \
+    -o ForwardAgent=no \
+    -o PreferredAuthentications=none \
+    -o PubkeyAuthentication=no \
+    -o PasswordAuthentication=no \
+    -o KbdInteractiveAuthentication=no \
+    -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$known_hosts" \
+    -o ConnectTimeout=5 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=3 \
+    -o ServerAliveCountMax=2 \
+    -o ControlMaster=no \
+    "root@$host" "$@"

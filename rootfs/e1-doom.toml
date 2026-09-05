@@ -1,0 +1,55 @@
+# Model-specific proof-of-concept defaults. Runtime code locations are resolved
+# semantically and fail closed; this records choices rather than offering a UI.
+[target]
+model = "E1 Zoom E340"
+hardware = "IPC_NT14NA48MPSD6"
+reference_firmware = "v3.2.0.4741_2503281992"
+compatibility = "ELF relocations plus exact/masked semantic signatures"
+tested_device_md5 = ["8afd998456cfa148051689a9c1089380", "186ebe9a79115b4137367e015d2dd18e"]
+
+[video]
+reolink_quality = "Fluent"
+encoder = 2
+width = 640
+height = 360
+doom_internal_width = 426
+doom_internal_height = 200
+doom_logical_viewport = "426x200"
+doom_pixel_aspect = "5:6"
+presentation_width = 640
+presentation_height = 360
+alternate_internal_profile = "640x300"
+presentation_fps_source = "/proc/hdal/venc/info encoder 2"
+
+[audio]
+codec = "MPEG-2 AAC-LC"
+sample_rate = 16000
+channels = 1
+samples_per_frame = 1024
+queue_slots = 8
+prebuffer_frames = 3
+music = true
+music_backend = "nine-voice OPL2 / emu8950"
+opl_sample_stride = 4
+
+[controls]
+secret = "U U D D L R L R"
+up_double_tap = "Fire+Use+Confirm"
+down_hold_seconds = 3
+http_port = 666
+http_heartbeat_ms = 2500
+
+[runtime]
+game_lifecycle = "on-demand child"
+controller_lifecycle = "armed listener"
+ready_gate = "first complete framebuffer plus audio and input"
+exit_audio = "pldeth only during exit melt"
+startup_screen = "TITLEPIC"
+attract_demo_delay_seconds = 20
+attract_demo_delay_clock = "monotonic wall time"
+attract_demo_delay_starts = "doom mode after entry melt"
+
+[storage]
+default_root = "/mnt/sda/e1-doom-flat"
+runtime = "/mnt/tmp/e1-doom"
+storage = "flat SD-card directory"

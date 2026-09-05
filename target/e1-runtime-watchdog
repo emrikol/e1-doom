@@ -1,0 +1,122 @@
+#!/bin/sh
+# Detached runtime owner. If the foreground coordinator dies or stops updating
+# its heartbeat, run both already-proven immediate restoration paths.
+set -u
+
+owner=${1:-}
+runtime=/mnt/tmp/e1-doom
+state="$runtime/state"
+log_file="$state/runtime-watchdog.log"
+
+case "$owner" in
+    ''|*[!0-9]*) exit 2 ;;
+esac
+
+log()
+{
+    now=$(/bin/date +%s 2>/dev/null || echo 0)
+    echo "$now $*" >>"$log_file"
+}
+
+owner_valid()
+{
+    test -r "/proc/$owner/cmdline" || return 1
+    command_line=$(/bin/busybox tr '\000' ' ' <"/proc/$owner/cmdline")
+    case "$command_line" in
+        *e1-doom-runtime*) return 0 ;;
+    esac
+    return 1
+}
+
+owner_valid || exit 2
+echo ready >"$state/runtime-watchdog.ready"
+log "ready owner=$owner"
+
+while :; do
+    if test -f "$state/runtime-watchdog.disarm"; then
+        log disarmed
+        echo disarmed >"$state/runtime-watchdog.exited"
+        exit 0
+    fi
+    fire=0
+    if ! owner_valid || ! /bin/kill -0 "$owner" 2>/dev/null; then
+        fire=1
+        reason="owner-gone"
+    elif test ! -f "$state/runtime.heartbeat"; then
+        fire=1
+        reason="heartbeat-missing"
+    else
+        now=$(/bin/date +%s 2>/dev/null || echo 0)
+        modified=$(/bin/stat -c %Y "$state/runtime.heartbeat" 2>/dev/null || echo 0)
+        if test $((now - modified)) -ge 20; then
+            fire=1
+            reason="heartbeat-stale"
+        fi
+    fi
+    test "$fire" -eq 0 || break
+    /bin/sleep 1
+done
+
+echo "$reason" >"$state/runtime-watchdog.fired"
+log "fired reason=$reason"
+
+stop_recorded_child()
+{
+    role=$1
+    expected=$2
+    pid_file="$state/$role.pid"
+    test -s "$pid_file" || return 0
+    pid=$(/bin/busybox head -n 1 "$pid_file")
+    case "$pid" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    test -r "/proc/$pid/cmdline" || return 0
+    command_line=$(/bin/busybox tr '\000' ' ' <"/proc/$pid/cmdline")
+    case "$command_line" in
+        *"$expected"*) ;;
+        *) log "refuse-stop role=$role pid=$pid cmd=$command_line"; return 1 ;;
+    esac
+    /bin/kill -TERM "$pid" 2>/dev/null || true
+    attempt=0
+    while test "$attempt" -lt 10 && /bin/kill -0 "$pid" 2>/dev/null; do
+        /bin/sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    if /bin/kill -0 "$pid" 2>/dev/null; then
+        /bin/kill -KILL "$pid" 2>/dev/null || true
+    fi
+    log "stopped role=$role pid=$pid"
+}
+
+stop_recorded_child game /e1-doom || true
+stop_recorded_child controller /e1-doom-controller || true
+
+ptz_status=0
+/bin/sh "$runtime/e1-ptz-device-deadman" restore-only \
+    >>"$state/runtime-watchdog-ptz.log" 2>&1 || ptz_status=$?
+audio_status=0
+/bin/sh "$runtime/e1-audio-device-deadman" restore-only \
+    >>"$state/runtime-watchdog-audio.log" 2>&1 || audio_status=$?
+finalize_status=0
+if test "$audio_status" -eq 0 && test "$ptz_status" -eq 0; then
+    /bin/sh "$runtime/e1-injected-finalize" \
+        >>"$state/runtime-watchdog-finalize.log" 2>&1 || finalize_status=$?
+else
+    finalize_status=1
+fi
+
+device_pid=$(/bin/pidof device 2>/dev/null || true)
+if test "$audio_status" -eq 0 && test "$ptz_status" -eq 0 &&
+   test "$finalize_status" -eq 0 &&
+   test -n "$device_pid" &&
+   ! grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps" &&
+   test ! -f "$state/audio.patch.active" &&
+   test ! -f "$state/ptz.patch.active"; then
+    echo complete >"$state/runtime-recovery.complete"
+    log recovery-complete
+    exit 0
+fi
+
+echo failed >"$state/runtime-recovery.failed"
+log "recovery-failed audio=$audio_status ptz=$ptz_status finalize=$finalize_status device=$device_pid"
+exit 1

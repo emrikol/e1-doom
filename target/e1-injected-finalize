@@ -1,0 +1,103 @@
+#!/bin/sh
+# Finalize a composed PTZ+audio recovery only after both patch sites and both
+# hook entry points are proven quiescent. This is the only recovery stage that
+# permits the injected library to unload.
+set -u
+
+runtime=/mnt/tmp/e1-doom
+state="$runtime/state"
+
+atomic_command()
+{
+    command_tmp="$state/injected.command.finalize.$$"
+    echo "$*" >"$command_tmp"
+    mv "$command_tmp" "$state/injected.command"
+}
+
+device_pid=$(/bin/pidof device 2>/dev/null || true)
+test -n "$device_pid" || exit 1
+test ! -f "$state/ptz.patch.active" || exit 1
+test ! -f "$state/audio.patch.active" || exit 1
+
+if test -f "$state/ptz.patch.used"; then
+    test -f "$state/ptz.restored" || exit 1
+    test -f "$state/ptz.hook.quiesced" || exit 1
+fi
+if test -f "$state/audio.patch.used"; then
+    test -f "$state/audio.restored" || exit 1
+    test -f "$state/audio.hook.quiesced" || exit 1
+fi
+
+"$runtime/e1-ptz-patch-supervisor" --inspect-device "$device_pid" || exit 1
+"$runtime/e1-ptz-patch-supervisor" \
+    --inspect-device-audio "$device_pid" || exit 1
+
+if grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps"; then
+    supervisor=
+    if test -s "$state/supervisor.pid"; then
+        supervisor=$(/bin/busybox head -n 1 "$state/supervisor.pid")
+    fi
+    case "$supervisor" in
+        ''|*[!0-9]*) supervisor= ;;
+    esac
+    if test -n "$supervisor" && test -r "/proc/$supervisor/cmdline" &&
+       /bin/busybox tr '\000' ' ' <"/proc/$supervisor/cmdline" |
+           grep -q e1-injected-supervisor; then
+        /bin/kill -USR1 "$supervisor" 2>/dev/null || true
+    else
+        atomic_command quit
+    fi
+
+    count=0
+    while test "$count" -lt 15 &&
+          { grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps" ||
+            ! test -f "$state/restored"; }; do
+        /bin/sleep 1
+        count=$((count + 1))
+    done
+fi
+
+if grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps"; then
+    atomic_command quit
+    count=0
+    while test "$count" -lt 8 && ! test -f "$state/thread.exited"; do
+        /bin/sleep 1
+        count=$((count + 1))
+    done
+    test -f "$state/thread.exited" || exit 1
+    test -f "$state/media.restored" || exit 1
+    test ! -f "$state/media.active" || exit 1
+    test ! -f "$state/audio.active" || exit 1
+    if test -f "$state/audio.patch.used"; then
+        test -f "$state/audio.restored" || exit 1
+        test -f "$state/audio.hook.quiesced" || exit 1
+    fi
+    "$runtime/e1-ptz-patch-supervisor" \
+        --inspect-device "$device_pid" || exit 1
+    "$runtime/e1-ptz-patch-supervisor" \
+        --inspect-device-audio "$device_pid" || exit 1
+    handle=$(/bin/busybox head -n 1 "$state/injected.handle" 2>/dev/null || true)
+    case "$handle" in
+        0x[0-9a-fA-F]*) ;;
+        *) exit 1 ;;
+    esac
+    "$runtime/e1-doom-injector" --unload "$device_pid" "$handle" || exit 1
+fi
+
+test ! -f "$state/ptz.patch.active" || exit 1
+test ! -f "$state/audio.patch.active" || exit 1
+test ! -f "$state/media.active" || exit 1
+test ! -f "$state/audio.active" || exit 1
+! grep -q 'e1-doom-injected.so' "/proc/$device_pid/maps" || exit 1
+"$runtime/e1-ptz-patch-supervisor" --inspect-device "$device_pid" || exit 1
+"$runtime/e1-ptz-patch-supervisor" \
+    --inspect-device-audio "$device_pid" || exit 1
+
+rm -f "$state/injected.handle" "$state/hook.active" \
+    "$state/ptz.patch.used" "$state/ptz.patch.restored" \
+    "$state/ptz.hook.quiesced" "$state/audio.patch.used"
+rm -f "$state/recovery.failed" "$state/audio.recovery.failed" \
+    "$state/ptz.recovery.failed"
+echo injected-cleanup-complete >"$state/restored"
+echo complete >"$state/injected-finalize.complete"
+exit 0

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+host=$("$tool_dir/e1-resolve")
+printf 'http://%s:666/\n' "$host"

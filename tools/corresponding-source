@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH='' cd -- "$tool_dir/.." && pwd)
+# shellcheck disable=SC1091
+. "$project_dir/sources.lock"
+archive_dir=${DIST_DIR:-"$project_dir/dist"}
+archive="$archive_dir/e1-doom-corresponding-source.tar.gz"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/e1-doom-source.XXXXXX")
+
+cleanup()
+{
+    rm -rf "$stage"
+}
+trap cleanup EXIT HUP INT TERM
+
+git -C "$project_dir" rev-parse --verify HEAD >/dev/null
+git -C "$project_dir" diff --quiet
+git -C "$project_dir" diff --cached --quiet
+
+mkdir -p "$stage/e1-doom" "$archive_dir"
+git -C "$project_dir" archive HEAD | tar -xf - -C "$stage/e1-doom"
+woof_source="$project_dir/.deps/woof"
+woof_target="$stage/e1-doom/.deps/woof"
+rp_source="$project_dir/.deps/rp2040-doom"
+rp_target="$stage/e1-doom/.deps/rp2040-doom"
+test -d "$woof_source/.git"
+test -d "$rp_source/.git"
+
+mkdir -p "$woof_target/base" "$woof_target/third-party" \
+    "$rp_target/opl"
+rsync -a "$woof_source/src" "$woof_source/opl" "$woof_target/"
+rsync -a "$woof_source/base/all-all" "$woof_source/base/doom-all" \
+    "$woof_target/base/"
+for dependency in md5 miniz sha1 spng yyjson; do
+    rsync -a "$woof_source/third-party/$dependency" \
+        "$woof_target/third-party/"
+done
+install -m 0644 "$woof_source/COPYING" "$woof_source/README.md" \
+    "$woof_target/"
+for file in emu8950.c emu8950.h slot_render.cpp slot_render.h; do
+    install -m 0644 "$rp_source/opl/$file" "$rp_target/opl/$file"
+done
+install -m 0644 "$rp_source/README.md" "$rp_target/README.md"
+
+printf '%s\n' "$WOOF_COMMIT" > \
+    "$woof_target/.e1-doom-corresponding-source"
+printf '%s\n' "$RP2040_DOOM_COMMIT" > \
+    "$rp_target/.e1-doom-corresponding-source"
+
+rm -f "$archive"
+tar -czf "$archive" -C "$stage" e1-doom
+echo "$archive"

@@ -1,0 +1,127 @@
+#!/bin/sh
+# Measure Doom and stock device threads over one fixed live interval.
+set -eu
+
+tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+seconds=${1:-20}
+
+case "$seconds" in
+    ''|*[!0-9]*)
+        echo "usage: $0 [seconds]" >&2
+        exit 2
+        ;;
+esac
+if [ "$seconds" -lt 1 ] || [ "$seconds" -gt 60 ]; then
+    echo "profile duration must be 1..60 seconds" >&2
+    exit 2
+fi
+
+"$tool_dir/e1-ssh" "E1_PROFILE_SECONDS=$seconds /bin/sh -s" <<'REMOTE'
+set -eu
+
+state=/mnt/tmp/e1-doom/state
+game=$(cat "$state/game.pid")
+device=$(pidof device)
+case "$game" in
+    ''|*[!0-9]*) exit 3 ;;
+esac
+case "$device" in
+    ''|*[!0-9]*) exit 3 ;;
+esac
+test -r "/proc/$game/stat"
+test -r "/proc/$device/stat"
+
+start="$state/cpu-profile.start"
+result="$state/cpu-profile.result"
+core_start="$state/cpu-profile.cores"
+: >"$start"
+
+for process in "$game" "$device"; do
+    for task in /proc/"$process"/task/*; do
+        tid=${task##*/}
+        comm=$(cat "$task/comm" 2>/dev/null) || continue
+        ticks=$(awk '{print $14 + $15}' "$task/stat" 2>/dev/null) || continue
+        echo "$process $tid $comm $ticks" >>"$start"
+    done
+done
+
+for process in "$game" "$device"; do
+    for task in /proc/"$process"/task/*; do
+        tid=${task##*/}
+        comm=$(cat "$task/comm" 2>/dev/null) || continue
+        case "$comm" in
+            e1-doom|e1-audio|e1-doom-osg|bc_audio|bc_osd|bc_avencoder)
+                allowed=$(awk '/Cpus_allowed_list/ {print $2}' "$task/status")
+                processor=$(awk '{print $39}' "$task/stat")
+                echo "placement tid=$tid name=$comm allowed=$allowed cpu=$processor"
+                ;;
+        esac
+    done
+done
+
+awk '/^cpu[0-9]+ / {
+    total = 0
+    for (field = 2; field <= NF; ++field) total += $field
+    print $1, total, $5 + $6
+}' /proc/stat >"$core_start"
+
+set -- $(awk '/^cpu / {
+    total = 0
+    for (field = 2; field <= NF; ++field) total += $field
+    print total, $5 + $6
+    exit
+}' /proc/stat)
+total_before=$1
+idle_before=$2
+
+sleep "$E1_PROFILE_SECONDS"
+
+set -- $(awk '/^cpu / {
+    total = 0
+    for (field = 2; field <= NF; ++field) total += $field
+    print total, $5 + $6
+    exit
+}' /proc/stat)
+total_after=$1
+idle_after=$2
+
+: >"$result"
+while read -r process tid comm before; do
+    stat="/proc/$process/task/$tid/stat"
+    test -r "$stat" || continue
+    after=$(awk '{print $14 + $15}' "$stat")
+    delta=$((after - before))
+    if [ "$delta" -gt 0 ]; then
+        echo "$delta $process $tid $comm" >>"$result"
+    fi
+done <"$start"
+
+total=$((total_after - total_before))
+idle=$((idle_after - idle_before))
+busy=$((total - idle))
+echo "seconds=$E1_PROFILE_SECONDS aggregate_ticks=$total busy=$busy idle=$idle"
+while read -r core core_total_before core_idle_before; do
+    set -- $(awk -v wanted="$core" '$1 == wanted {
+        total = 0
+        for (field = 2; field <= NF; ++field) total += $field
+        print total, $5 + $6
+    }' /proc/stat)
+    core_total=$(($1 - core_total_before))
+    core_idle=$(($2 - core_idle_before))
+    core_busy=$((core_total - core_idle))
+    echo "$core ticks=$core_total busy=$core_busy idle=$core_idle"
+done <"$core_start"
+owned_ticks=$(awk '
+    $4 == "e1-doom" || $4 == "e1-audio" || $4 == "e1-doom-osg" {
+        total += $1
+    }
+    END { print total + 0 }
+' "$result")
+echo "owned_ticks=$owned_ticks"
+sort -nr "$result" | head -20
+if test -s "$state/audio.encoded"; then
+    cat "$state/audio.encoded"
+else
+    echo "audio_encoded=inactive"
+fi
+REMOTE

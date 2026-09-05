@@ -1,0 +1,6 @@
+# Upstream source identities used by E1 Doom.
+WOOF_URL=https://github.com/fabiangreffrath/woof.git
+WOOF_COMMIT=9f124c6269926f90231592ea1bd2c39358ad17c9
+WOOF_VERSION=15.3.0
+RP2040_DOOM_URL=https://github.com/kilograham/rp2040-doom.git
+RP2040_DOOM_COMMIT=29a453c980918a03e40fc8b69b024e7a3bdb5dc2

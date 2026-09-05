@@ -1,0 +1,18 @@
+#!/bin/sh
+# Capture full OSG diagnostics plus the stable topology. Stock clock stamps
+# legitimately change width/x and ping-pong draw state while the camera runs.
+set -eu
+
+output=${1:?output path required}
+cat /proc/hdal/osg/info >"$output"
+awk '
+    /VIDEOENC [0-9]+ BUFFER/ { encoder = $2; section = "buffer"; next }
+    /VIDEOENC [0-9]+ STAMP/  { encoder = $2; section = "stamp"; next }
+    /^-------------------------/ { section = ""; next }
+    section == "buffer" && $1 ~ /^[0-9]+$/ {
+        print "buffer", encoder, $1, $2, $3
+    }
+    section == "stamp" && $1 ~ /^[0-9]+$/ {
+        print "stamp", encoder, $1, $2, $4, $5, $6, $7, $8, $9
+    }
+' "$output" >"$output.normalized"
