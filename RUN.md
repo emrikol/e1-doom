@@ -24,6 +24,8 @@ Check the listener with:
 
 The normal result is `active ... mode=camera-armed`.
 
+If port 666 disappears after a reboot even though the payload and enable marker remain on the SD card, check the separate persistent-root bootstrap first. An update or another camera project can preserve every E1 Doom file while replacing the one local hook that invokes `e1-doom-boot`. Reapply that integration hook and run the status command above; there is no reason to rebuild or recopy the Doom payload. This repository intentionally does not supply or modify the bootstrap itself.
+
 ## Start and play
 
 Open the camera's Fluent stream in the Reolink app. Start Doom from the port-666 dashboard or enter Up, Up, Down, Down, Left, Right, Left, Right on the PTZ pad. Some app versions send short taps as directionless stop events; E1 Doom recognizes the eight timed stop events as the same toggle. Held PTZ directions continue to work, and double-tap Up is the toy Fire+Use/Confirm gesture.
