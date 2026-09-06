@@ -206,6 +206,8 @@ $(BUILD_DIR)/e1-runtime-control-test: src/tests/e1-runtime-control-test.c \
 	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Werror -I$(E1_COMMON_DIR) -o $@ $<
 $(BUILD_DIR)/e1-melt-test: src/tests/e1-melt-test.c $(E1_COMMON_DIR)/e1-melt.h | $(BUILD_DIR)
 	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Werror -I$(E1_COMMON_DIR) -o $@ $<
+$(BUILD_DIR)/e1-bogomips: src/tests/e1-bogomips.c | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Werror -pthread -o $@ $<
 $(BUILD_DIR)/e1-audio-contract-test: src/tests/e1-audio-contract-test.c \
 	$(E1_COMMON_DIR)/e1-audio-contract.h | $(BUILD_DIR)
 	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Werror -I$(E1_COMMON_DIR) -o $@ $<
