@@ -139,6 +139,11 @@ start_controller()
 
 start_game()
 {
+    audio_free_run=0
+
+    if test -f /mnt/sda/e1-doom-audio-capture-free-run; then
+        audio_free_run=1
+    fi
     test -z "$game_pid" || return 1
     rm -f "$state/game.ready" "$state/game.pid" "$state/game.start.failed" \
         "$state/dashboard.start" "$state/dashboard.camera" \
@@ -148,6 +153,7 @@ start_game()
     E1_DOOM_RUNTIME_STATE="$state" \
     E1_DOOM_FRAMEBUFFER="$state/framebuffer.shm" \
     E1_DOOM_AUDIO="$runtime/audio.pcm" \
+    E1_DOOM_AUDIO_FREE_RUN="$audio_free_run" \
     E1_DOOM_PTZ_SOCKET="$state/ptz.sock" \
     E1_DOOM_HEIGHT="$render_height" E1_DOOM_FPS="$video_fps" \
     E1_DOOM_RUN_SECONDS=0 E1_DOOM_HTTP_PORT=0 \

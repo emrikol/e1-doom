@@ -32,6 +32,9 @@
 #define DMX_HEADER_SIZE 8U
 #define DMX_PAD_SIZE 16U
 #define E1_AUDIO_THREAD_POLL_NS 32000000L
+#define E1_AUDIO_FRAME_US \
+    ((uint64_t)E1_AUDIO_SAMPLES_PER_FRAME * UINT64_C(1000000) / \
+     E1_AUDIO_SAMPLE_RATE)
 #define E1_OPL_MAX_SOURCE_FRAMES \
     ((OPL_SAMPLE_RATE * E1_AUDIO_SAMPLES_PER_FRAME + \
       E1_AUDIO_SAMPLE_RATE - 1U) / E1_AUDIO_SAMPLE_RATE + 1U)
@@ -61,6 +64,8 @@ static boolean music_registered;
 static boolean music_playing;
 static boolean music_paused;
 static boolean exit_audio_only;
+static boolean audio_free_run;
+static uint64_t audio_next_frame_us;
 
 static int16_t clamp_s16(int32_t sample)
 {
@@ -181,8 +186,22 @@ static void fill_audio_prebuffer(void)
 {
     int16_t output[E1_AUDIO_SAMPLES_PER_FRAME];
     unsigned int generated = 0;
+    uint64_t now_us;
 
     if (!sound_initialized || audio_ring == NULL) {
+        return;
+    }
+    if (audio_free_run) {
+        now_us = I_GetTimeUS();
+        while ((frame_number < E1_AUDIO_PREBUFFER_FRAMES ||
+                now_us >= audio_next_frame_us) &&
+               generated < E1_AUDIO_RING_SLOTS) {
+            e1_sfx_mix_frame(voices, E1_SFX_MAX_VOICES, output);
+            mix_music_frame(output);
+            publish_frame(output);
+            audio_next_frame_us += E1_AUDIO_FRAME_US;
+            ++generated;
+        }
         return;
     }
     while (frame_number - audio_ring->consumed_frame <
@@ -271,6 +290,9 @@ void I_InitSound(void)
     mixed_frames = 0;
     dropped_frames = 0;
     started_sfx = 0;
+    audio_free_run = getenv("E1_DOOM_AUDIO_FREE_RUN") != NULL &&
+                     strcmp(getenv("E1_DOOM_AUDIO_FREE_RUN"), "1") == 0;
+    audio_next_frame_us = I_GetTimeUS();
     test_sfx = getenv("E1_DOOM_TEST_SFX");
     test_sfx_remaining = test_sfx == NULL ? 0U : (unsigned int)atoi(test_sfx);
     if (test_sfx != NULL && test_sfx_remaining == 0U) {
@@ -309,6 +331,7 @@ void I_ShutdownSound(void)
         audio_thread_started = false;
     }
     sound_initialized = false;
+    audio_free_run = false;
     (void)pthread_mutex_lock(&audio_mutex);
     memset(voices, 0, sizeof(voices));
     I_Printf(VB_ALWAYS, "E1_AUDIO done frames=%u drops=%u\n",
