@@ -52,6 +52,7 @@ static uint32_t frame_number;
 static uint32_t mixed_frames;
 /* Capture instrumentation: isolate one source so each can be recorded alone. */
 static int audio_isolate; /* 0 both, 1 music only, 2 sfx only */
+static int audio_isolate_voice = -1; /* >=0 selects a single sfx voice */
 static uint32_t dropped_frames;
 static uint32_t started_sfx;
 static boolean sound_initialized;
@@ -200,6 +201,8 @@ static void fill_audio_prebuffer(void)
                generated < E1_AUDIO_RING_SLOTS) {
             if (audio_isolate == 1) {
                 memset(output, 0, sizeof(output));
+            } else if (audio_isolate_voice >= 0) {
+                e1_sfx_mix_frame(&voices[audio_isolate_voice], 1U, output);
             } else {
                 e1_sfx_mix_frame(voices, E1_SFX_MAX_VOICES, output);
             }
@@ -217,6 +220,8 @@ static void fill_audio_prebuffer(void)
            generated < E1_AUDIO_RING_SLOTS) {
         if (audio_isolate == 1) {
             memset(output, 0, sizeof(output));
+        } else if (audio_isolate_voice >= 0) {
+            e1_sfx_mix_frame(&voices[audio_isolate_voice], 1U, output);
         } else {
             e1_sfx_mix_frame(voices, E1_SFX_MAX_VOICES, output);
         }
@@ -312,8 +317,14 @@ void I_InitSound(void)
         if (isolate != NULL) {
             if (strcmp(isolate, "music") == 0) {
                 audio_isolate = 1;
-            } else if (strcmp(isolate, "sfx") == 0) {
+            } else if (strncmp(isolate, "sfx", 3) == 0) {
                 audio_isolate = 2;
+                if (isolate[3] == ':') {
+                    int want = atoi(isolate + 4);
+                    if (want >= 0 && want < (int)E1_SFX_MAX_VOICES) {
+                        audio_isolate_voice = want;
+                    }
+                }
             }
         }
     }
