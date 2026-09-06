@@ -50,6 +50,8 @@ static atomic_bool audio_thread_stop;
 static boolean audio_thread_started;
 static uint32_t frame_number;
 static uint32_t mixed_frames;
+/* Capture instrumentation: isolate one source so each can be recorded alone. */
+static int audio_isolate; /* 0 both, 1 music only, 2 sfx only */
 static uint32_t dropped_frames;
 static uint32_t started_sfx;
 static boolean sound_initialized;
@@ -196,8 +198,14 @@ static void fill_audio_prebuffer(void)
         while ((frame_number < E1_AUDIO_PREBUFFER_FRAMES ||
                 now_us >= audio_next_frame_us) &&
                generated < E1_AUDIO_RING_SLOTS) {
-            e1_sfx_mix_frame(voices, E1_SFX_MAX_VOICES, output);
-            mix_music_frame(output);
+            if (audio_isolate == 1) {
+                memset(output, 0, sizeof(output));
+            } else {
+                e1_sfx_mix_frame(voices, E1_SFX_MAX_VOICES, output);
+            }
+            if (audio_isolate != 2) {
+                mix_music_frame(output);
+            }
             publish_frame(output);
             audio_next_frame_us += E1_AUDIO_FRAME_US;
             ++generated;
@@ -207,8 +215,14 @@ static void fill_audio_prebuffer(void)
     while (frame_number - audio_ring->consumed_frame <
                E1_AUDIO_PREBUFFER_FRAMES &&
            generated < E1_AUDIO_RING_SLOTS) {
-        e1_sfx_mix_frame(voices, E1_SFX_MAX_VOICES, output);
-        mix_music_frame(output);
+        if (audio_isolate == 1) {
+            memset(output, 0, sizeof(output));
+        } else {
+            e1_sfx_mix_frame(voices, E1_SFX_MAX_VOICES, output);
+        }
+        if (audio_isolate != 2) {
+            mix_music_frame(output);
+        }
         publish_frame(output);
         ++generated;
     }
@@ -292,6 +306,17 @@ void I_InitSound(void)
     started_sfx = 0;
     audio_free_run = getenv("E1_DOOM_AUDIO_FREE_RUN") != NULL &&
                      strcmp(getenv("E1_DOOM_AUDIO_FREE_RUN"), "1") == 0;
+    {
+        const char *isolate = getenv("E1_DOOM_AUDIO_ISOLATE");
+        audio_isolate = 0;
+        if (isolate != NULL) {
+            if (strcmp(isolate, "music") == 0) {
+                audio_isolate = 1;
+            } else if (strcmp(isolate, "sfx") == 0) {
+                audio_isolate = 2;
+            }
+        }
+    }
     audio_next_frame_us = I_GetTimeUS();
     test_sfx = getenv("E1_DOOM_TEST_SFX");
     test_sfx_remaining = test_sfx == NULL ? 0U : (unsigned int)atoi(test_sfx);
