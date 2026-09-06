@@ -53,6 +53,37 @@ static void run_profile(unsigned int width, unsigned int height)
     free(pixels);
 }
 
+static void test_nv12_snapshot(void)
+{
+    uint8_t *luma = malloc(E1_OSG_WIDTH * E1_OSG_HEIGHT);
+    uint8_t *chroma = malloc(E1_OSG_WIDTH * E1_OSG_HEIGHT / 2U);
+    uint16_t *output = malloc(E1_OSG_WIDTH * E1_OSG_HEIGHT *
+                              sizeof(*output));
+    size_t index;
+
+    assert(luma != NULL && chroma != NULL && output != NULL);
+    memset(luma, 16, E1_OSG_WIDTH * E1_OSG_HEIGHT);
+    memset(chroma, 128, E1_OSG_WIDTH * E1_OSG_HEIGHT / 2U);
+    luma[0] = 235;
+    luma[1] = 126;
+
+    assert(e1_convert_nv12_argb4444(
+               output, luma, chroma, E1_OSG_WIDTH, E1_OSG_HEIGHT,
+               E1_OSG_WIDTH, E1_OSG_WIDTH) == 0);
+    assert(output[0] == UINT16_C(0xffff));
+    assert(output[1] == UINT16_C(0xf888));
+    for (index = 2; index < E1_OSG_WIDTH * E1_OSG_HEIGHT; ++index) {
+        assert(output[index] == UINT16_C(0xf000));
+    }
+    assert(e1_convert_nv12_argb4444(
+               output, luma, chroma, E1_OSG_WIDTH, E1_OSG_HEIGHT,
+               E1_OSG_WIDTH - 1U, E1_OSG_WIDTH) == -1);
+
+    free(output);
+    free(chroma);
+    free(luma);
+}
+
 int main(void)
 {
     uint16_t x_map[E1_OSG_WIDTH];
@@ -60,6 +91,7 @@ int main(void)
 
     run_profile(426, 200);
     run_profile(640, 300);
+    test_nv12_snapshot();
     assert(e1_build_scale_maps(320, 200, x_map, y_map) == -1);
     assert(e1_frame_sequence_drops(0, 20) == 0);
     assert(e1_frame_sequence_drops(20, 20) == 0);

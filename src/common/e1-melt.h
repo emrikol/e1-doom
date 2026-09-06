@@ -108,7 +108,7 @@ static inline unsigned int e1_melt_scaled_row(int row, unsigned int height)
 }
 
 static inline void e1_melt_compose_entry(
-    uint16_t *output, const uint16_t *doom,
+    uint16_t *output, const uint16_t *doom, const uint16_t *snapshot,
     unsigned int width, unsigned int height,
     const struct e1_melt_state *state)
 {
@@ -118,11 +118,12 @@ static inline void e1_melt_compose_entry(
     for (x = 0; x < width; ++x) {
         unsigned int column = (unsigned int)((uint64_t)x * E1_MELT_COLUMNS /
                                              width);
-        unsigned int reveal = e1_melt_scaled_row(state->row[column], height);
+        unsigned int drop = e1_melt_scaled_row(state->row[column], height);
 
         for (y = 0; y < height; ++y) {
             size_t offset = (size_t)y * width + x;
-            output[offset] = y < reveal ? doom[offset] : E1_MELT_TRANSPARENT;
+            output[offset] = y < drop ? doom[offset] :
+                snapshot[(size_t)(y - drop) * width + x];
         }
     }
 }

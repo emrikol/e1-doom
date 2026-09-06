@@ -26,7 +26,7 @@
 #include "e1-ptz-event.h"
 #include "e1-runtime-control.h"
 
-#define BUILD_ID "e1-doom-injected-v27"
+#define BUILD_ID "e1-doom-injected-v28"
 #define STATE_DIR "/mnt/tmp/e1-doom/state"
 #define DEVICE_TARGET "/mnt/app/device"
 #define COMMAND_PATH STATE_DIR "/injected.command"
@@ -148,6 +148,8 @@ typedef HD_RESULT (*videoenc_start_fn)(HD_PATH_ID);
 typedef HD_RESULT (*videoenc_stop_fn)(HD_PATH_ID);
 typedef HD_RESULT (*videoenc_close_fn)(HD_PATH_ID);
 typedef HD_RESULT (*videoenc_set_fn)(HD_PATH_ID, HD_VIDEOENC_PARAM_ID, void *);
+typedef HD_RESULT (*videoproc_pull_fn)(HD_PATH_ID, HD_VIDEO_FRAME *, INT32);
+typedef HD_RESULT (*videoproc_release_fn)(HD_PATH_ID, HD_VIDEO_FRAME *);
 typedef void *(*mem_mmap_fn)(HD_COMMON_MEM_MEM_TYPE, UINT32, UINT32);
 typedef HD_RESULT (*mem_munmap_fn)(void *, unsigned int);
 typedef HD_RESULT (*audioenc_open_fn)(HD_IN_ID, HD_OUT_ID, HD_PATH_ID *);
@@ -221,6 +223,7 @@ struct media_state {
     HD_PATH_ID path;
     uint16_t *pixels;
     uint16_t *doom_pixels;
+    uint16_t *camera_pixels;
     unsigned int width;
     unsigned int height;
     unsigned int encoder;
@@ -281,6 +284,8 @@ static videoenc_start_fn videoenc_start_call;
 static videoenc_stop_fn videoenc_stop_call;
 static videoenc_close_fn videoenc_close_call;
 static videoenc_set_fn videoenc_set_call;
+static videoproc_pull_fn videoproc_pull_call;
+static videoproc_release_fn videoproc_release_call;
 static mem_mmap_fn mem_mmap_call;
 static mem_munmap_fn mem_munmap_call;
 static audioenc_open_fn audioenc_open_call;
@@ -609,6 +614,10 @@ static int resolve_self_device_sites(void)
                                  E1_DEVICE_FUNCTION_VIDEOENC_CLOSE);
         E1_ASSIGN_THUMB_FUNCTION(videoenc_set_call,
                                  E1_DEVICE_FUNCTION_VIDEOENC_SET);
+        E1_ASSIGN_THUMB_FUNCTION(videoproc_pull_call,
+                                 E1_DEVICE_FUNCTION_VIDEOPROC_PULL);
+        E1_ASSIGN_THUMB_FUNCTION(videoproc_release_call,
+                                 E1_DEVICE_FUNCTION_VIDEOPROC_RELEASE);
         E1_ASSIGN_THUMB_FUNCTION(mem_mmap_call, E1_DEVICE_FUNCTION_MEM_MMAP);
         E1_ASSIGN_THUMB_FUNCTION(mem_munmap_call,
                                  E1_DEVICE_FUNCTION_MEM_MUNMAP);
@@ -665,6 +674,116 @@ static HD_IN_ID encoder_input(unsigned int encoder)
     default:
         return HD_VIDEOENC_0_IN_0;
     }
+}
+
+struct e1_read_mapping {
+    void *base;
+    size_t size;
+    const uint8_t *bytes;
+};
+
+static int map_physical_readonly(int descriptor, UINT32 physical_address,
+                                 UINT32 size,
+                                 struct e1_read_mapping *mapping)
+{
+    long page_size = sysconf(_SC_PAGESIZE);
+    UINT32 aligned_address;
+    size_t offset;
+
+    memset(mapping, 0, sizeof(*mapping));
+    if (descriptor < 0 || physical_address == 0U || size == 0U ||
+        page_size <= 0 ||
+        ((unsigned long)page_size & ((unsigned long)page_size - 1UL)) != 0UL) {
+        return -1;
+    }
+    aligned_address =
+        physical_address & ~((UINT32)(unsigned long)page_size - 1U);
+    offset = physical_address - aligned_address;
+    if (offset > SIZE_MAX - size) {
+        return -1;
+    }
+    mapping->size = offset + size;
+    mapping->base = mmap(NULL, mapping->size, PROT_READ, MAP_SHARED,
+                         descriptor, (off_t)aligned_address);
+    if (mapping->base == MAP_FAILED) {
+        memset(mapping, 0, sizeof(*mapping));
+        return -1;
+    }
+    mapping->bytes = (const uint8_t *)mapping->base + offset;
+    return 0;
+}
+
+static void unmap_physical_readonly(struct e1_read_mapping *mapping)
+{
+    if (mapping->base != NULL) {
+        (void)munmap(mapping->base, mapping->size);
+    }
+    memset(mapping, 0, sizeof(*mapping));
+}
+
+static int capture_camera_snapshot(struct media_state *state)
+{
+    HD_VIDEO_FRAME frame;
+    struct e1_read_mapping luma_mapping;
+    struct e1_read_mapping chroma_mapping;
+    HD_RESULT pull_status;
+    HD_RESULT release_status;
+    UINT32 luma_size;
+    UINT32 chroma_size;
+    int memory_fd = -1;
+    int result = -1;
+
+    if (state->camera_pixels == NULL || videoproc_pull_call == NULL ||
+        videoproc_release_call == NULL) {
+        return -1;
+    }
+    memset(&frame, 0, sizeof(frame));
+    memset(&luma_mapping, 0, sizeof(luma_mapping));
+    memset(&chroma_mapping, 0, sizeof(chroma_mapping));
+    pull_status = videoproc_pull_call(
+        HD_VIDEOPROC_0_IN_0 | HD_VIDEOPROC_0_OUT_2, &frame, 500);
+    log_line("camera-snapshot-pull", (long)pull_status);
+    if (pull_status != HD_OK) {
+        return -1;
+    }
+    if (frame.pxlfmt != HD_VIDEO_PXLFMT_YUV420 ||
+        frame.dim.w != E1_OSG_WIDTH || frame.dim.h != E1_OSG_HEIGHT ||
+        frame.loff[0] < E1_OSG_WIDTH || frame.loff[1] < E1_OSG_WIDTH ||
+        frame.ph[0] < E1_OSG_HEIGHT ||
+        frame.ph[1] < E1_OSG_HEIGHT / 2U ||
+        frame.phy_addr[0] == 0U || frame.phy_addr[1] == 0U ||
+        frame.loff[0] > UINT32_MAX / frame.ph[0] ||
+        frame.loff[1] > UINT32_MAX / frame.ph[1]) {
+        log_line("camera-snapshot-invalid-frame", (long)frame.pxlfmt);
+        goto release;
+    }
+    luma_size = frame.loff[0] * frame.ph[0];
+    chroma_size = frame.loff[1] * frame.ph[1];
+    memory_fd = open("/dev/mem", O_RDONLY | O_CLOEXEC | O_SYNC);
+    if (memory_fd < 0 ||
+        map_physical_readonly(memory_fd, frame.phy_addr[0], luma_size,
+                              &luma_mapping) != 0 ||
+        map_physical_readonly(memory_fd, frame.phy_addr[1], chroma_size,
+                              &chroma_mapping) != 0) {
+        log_line("camera-snapshot-map", memory_fd < 0 ? -errno : -1);
+        goto release;
+    }
+    result = e1_convert_nv12_argb4444(
+        state->camera_pixels, luma_mapping.bytes, chroma_mapping.bytes,
+        (unsigned int)frame.dim.w, (unsigned int)frame.dim.h,
+        (unsigned int)frame.loff[0], (unsigned int)frame.loff[1]);
+    log_line("camera-snapshot-convert", result);
+
+release:
+    unmap_physical_readonly(&chroma_mapping);
+    unmap_physical_readonly(&luma_mapping);
+    if (memory_fd >= 0) {
+        (void)close(memory_fd);
+    }
+    release_status = videoproc_release_call(
+        HD_VIDEOPROC_0_IN_0 | HD_VIDEOPROC_0_OUT_2, &frame);
+    log_line("camera-snapshot-release", (long)release_status);
+    return release_status == HD_OK ? result : -1;
 }
 
 static UINT32 required_buffer_size(unsigned int width, unsigned int height)
@@ -1459,7 +1578,17 @@ static int start_media(struct media_state *state, unsigned int encoder,
         if (wait_for_stable_doom_frame(state, state->doom_pixels) != 0) {
             return -1;
         }
-        if (!state->entry_melt) {
+        if (state->entry_melt) {
+            state->camera_pixels =
+                malloc((size_t)width * height * sizeof(*state->camera_pixels));
+            if (state->camera_pixels == NULL ||
+                capture_camera_snapshot(state) != 0) {
+                log_line("camera-snapshot-failed", 0);
+                return -1;
+            }
+            memcpy(state->pixels, state->camera_pixels,
+                   (size_t)width * height * sizeof(*state->pixels));
+        } else {
             memcpy(state->pixels, state->doom_pixels,
                    (size_t)width * height * sizeof(*state->pixels));
         }
@@ -1564,6 +1693,8 @@ static int cleanup_media(struct media_state *state)
         state->pixels = NULL;
         free(state->doom_pixels);
         state->doom_pixels = NULL;
+        free(state->camera_pixels);
+        state->camera_pixels = NULL;
         state->checkerboard = 0;
         state->entry_melt = 0;
         state->melt_last_ms = 0;
@@ -1631,12 +1762,15 @@ static int update_entry_melt(struct media_state *state,
     }
     done = e1_melt_advance(&state->melt, ticks);
     e1_melt_compose_entry(state->pixels, state->doom_pixels,
+                          state->camera_pixels,
                           state->width, state->height, &state->melt);
     if (publish_image(state) != 0) {
         return -1;
     }
     if (done) {
         state->entry_melt = 0;
+        free(state->camera_pixels);
+        state->camera_pixels = NULL;
         if (e1_runtime_entry_complete(control) != 0 ||
             write_marker("runtime.mode", "doom") != 0) {
             return -1;

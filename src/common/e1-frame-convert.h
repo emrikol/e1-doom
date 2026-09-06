@@ -11,6 +11,67 @@
 #define E1_OSG_WIDTH 640U
 #define E1_OSG_HEIGHT 360U
 
+static inline uint8_t e1_clamp_rgb(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 255) {
+        return 255;
+    }
+    return (uint8_t)value;
+}
+
+/* Convert the stock 640x360 limited-range NV12 frame into the camera's
+ * full-alpha OSG format. This is used once at entry so the old camera image
+ * can fall away in front of Doom instead of merely remaining live beneath a
+ * growing Doom alpha mask. */
+static inline int e1_convert_nv12_argb4444(
+    uint16_t output[E1_OSG_WIDTH * E1_OSG_HEIGHT],
+    const uint8_t *luma, const uint8_t *chroma,
+    unsigned int width, unsigned int height,
+    unsigned int luma_pitch, unsigned int chroma_pitch)
+{
+    unsigned int y;
+
+    if (output == NULL || luma == NULL || chroma == NULL ||
+        width != E1_OSG_WIDTH || height != E1_OSG_HEIGHT ||
+        luma_pitch < width || chroma_pitch < width ||
+        (width & 1U) != 0U || (height & 1U) != 0U) {
+        return -1;
+    }
+    for (y = 0; y < height; ++y) {
+        const uint8_t *luma_row = luma + (size_t)y * luma_pitch;
+        const uint8_t *chroma_row =
+            chroma + (size_t)(y / 2U) * chroma_pitch;
+        uint16_t *destination = output + (size_t)y * width;
+        unsigned int x;
+
+        for (x = 0; x < width; ++x) {
+            int c = (int)luma_row[x] - 16;
+            int d = (int)chroma_row[x & ~1U] - 128;
+            int e = (int)chroma_row[(x & ~1U) + 1U] - 128;
+            uint8_t red;
+            uint8_t green;
+            uint8_t blue;
+
+            if (c < 0) {
+                c = 0;
+            }
+            red = e1_clamp_rgb((298 * c + 409 * e + 128) >> 8);
+            green = e1_clamp_rgb(
+                (298 * c - 100 * d - 208 * e + 128) >> 8);
+            blue = e1_clamp_rgb((298 * c + 516 * d + 128) >> 8);
+            destination[x] =
+                (uint16_t)(UINT16_C(0xf000) |
+                           ((uint16_t)(red >> 4U) << 8U) |
+                           ((uint16_t)(green >> 4U) << 4U) |
+                           (uint16_t)(blue >> 4U));
+        }
+    }
+    return 0;
+}
+
 static inline int e1_build_scale_maps(unsigned int source_width,
                                       unsigned int source_height,
                                       uint16_t x_map[E1_OSG_WIDTH],

@@ -252,11 +252,15 @@ replaced.
 ### 5.3 Entry and exit melts
 
 The melt is a deterministic 320-column state machine advancing at Doom's
-35 Hz timing independent of the 10 Hz H.264 presentation. During entry, each
-column changes from transparent camera to the current Doom frame. During exit,
-a snapshot of Doom drops away to transparency, revealing a fresh live camera
-image beneath it. Completion removes the OSG path entirely rather than leaving
-a transparent allocation behind.
+35 Hz timing independent of the 10 Hz H.264 presentation. Before entry attaches
+the OSG, the worker borrows one frame from the stock 640x360 VPROC output,
+copies its NV12 planes through `/dev/mem`, releases the stock buffer, and
+converts the snapshot to opaque ARGB4444. Those frozen camera columns then drop
+down in front of the current Doom frame, producing the same old-screen-falls-
+away composition used by Doom itself. During exit, a snapshot of Doom drops
+away to transparency, revealing a fresh live camera image beneath it.
+Completion removes the OSG path entirely rather than leaving a transparent
+allocation behind.
 
 Entry has a strict readiness gate. Doom atomically publishes `game.ready` with
 its PID and nonzero frame sequence only after WAD, audio, and input startup and
@@ -666,8 +670,9 @@ On 2026-09-04 a firmware update changed `/mnt/app/device` from MD5
 `8afd998456cfa148051689a9c1089380` to
 `186ebe9a79115b4137367e015d2dd18e`. The selected lower PTZ site moved from
 `0x62db0` to `0x68938`, while the PCM site moved from
-`0x9453c` to `0xaa2d8`, all 18 HDAL wrappers moved, and the loader GOT slots
-moved. The new semantic/ELF resolvers found both captured builds exactly. The
+`0x9453c` to `0xaa2d8`, all 18 wrappers used by the original runtime moved, and
+the loader GOT slots moved. The new semantic/ELF resolvers found both captured
+builds exactly. The
 updated-firmware live gate then produced:
 
 ```text
@@ -697,6 +702,12 @@ game SIGKILL exercised full recovery without changing device PID or boot ID.
 The final armed-idle sample used 96 ticks over 20 seconds across the complete
 retained control/recovery stack (4.8% of one core), with no game, framebuffer,
 PCM ring, or input socket present.
+
+Library v28 adds uniquely resolved VPROC pull/release wrappers to the original
+18-function set. Entry borrows and releases one stock frame before attaching
+OSG, so the live buffer is never held during the transition. The converted
+snapshot is freed as soon as entry completes. Snapshot conversion and melt
+direction are covered by host tests; the ARM hard-float build also passes.
 
 The final startup adjustment removed the artificial Escape that had covered
 `TITLEPIC` with the menu. Its first attract demo is now gated on fully visible

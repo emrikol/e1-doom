@@ -42,7 +42,7 @@ The WAD is copied only into the ignored build directory. It never becomes part o
 
 Copy `build/e1-doom-root` to `/mnt/sda/e1-doom-flat`, and copy the launcher and boot service to `/mnt/sda/e1-doom-run` and `/mnt/sda/e1-doom-boot`. How those files reach a rooted camera, and how a boot hook invokes `e1-doom-boot`, is intentionally left to the reader.
 
-The armed service leaves Doom stopped. Start it from the port-666 dashboard or with the eight-tap PTZ sequence Up, Up, Down, Down, Left, Right, Left, Right. The entry melt waits until Doom has initialized and published its first complete frame. Return to the camera from the dashboard, Doom's quit menu, the same PTZ sequence, or a long Down hold. Exit plays the Doom death sound over the melt, restores stock video/PTZ/microphone audio, and kills the game while leaving the lightweight controller armed.
+The armed service leaves Doom stopped. Start it from the port-666 dashboard or with the eight-tap PTZ sequence Up, Up, Down, Down, Left, Right, Left, Right. The entry melt waits until Doom has initialized and published its first complete frame, then drops a captured camera frame away in columns to reveal Doom underneath. Return to the camera from the dashboard, Doom's quit menu, the same PTZ sequence, or a long Down hold. Exit plays the Doom death sound over the melt, restores stock video/PTZ/microphone audio, and kills the game while leaving the lightweight controller armed.
 
 See [RUN.md](RUN.md) for controls and operational checks, and [IMPLEMENTATION.md](IMPLEMENTATION.md) for the full technical write-up.
 
